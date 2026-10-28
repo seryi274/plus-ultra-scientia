@@ -8,6 +8,7 @@ library can be moved or synced to another machine without breaking them."""
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,6 +54,16 @@ CREATE TABLE IF NOT EXISTS topics (
     name     TEXT NOT NULL UNIQUE,
     query    TEXT NOT NULL,
     created  TEXT NOT NULL
+);
+
+-- A topic is defined by one or more labelled queries (e.g. "il17", "jak"), all searched.
+CREATE TABLE IF NOT EXISTS topic_queries (
+    id        INTEGER PRIMARY KEY,
+    topic_id  INTEGER NOT NULL REFERENCES topics(id),
+    label     TEXT NOT NULL,
+    query     TEXT NOT NULL,
+    created   TEXT NOT NULL,
+    UNIQUE (topic_id, label)
 );
 
 CREATE TABLE IF NOT EXISTS searches (
@@ -115,6 +126,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def query_label(query: str) -> str:
+    """A short default label for a query: 'IL-17 inhibitors in axSpA' -> 'il-17-inhibitors-in-axspa'."""
+    slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-")
+    return slug[:40].rstrip("-") or "query"
+
+
 def _chunks(items: list, size: int):
     for i in range(0, len(items), size):
         yield items[i:i + size]
@@ -163,6 +180,12 @@ class Store:
             "INSERT OR IGNORE INTO openalex_aliases (openalex_id, paper_id)"
             " SELECT openalex_id, id FROM papers WHERE openalex_id IS NOT NULL"
         )
+        # Topics from before multi-query support kept their single query on the topic row.
+        self.conn.execute(
+            """INSERT INTO topic_queries (topic_id, label, query, created)
+               SELECT id, 'main', query, created FROM topics t WHERE query != ''
+               AND NOT EXISTS (SELECT 1 FROM topic_queries q WHERE q.topic_id = t.id)"""
+        )
         self.conn.commit()
         self._relativize_file_paths()
 
@@ -178,15 +201,38 @@ class Store:
 
     # -- topics -----------------------------------------------------------------
 
-    def upsert_topic(self, name: str, query: str) -> int:
+    def upsert_topic(self, name: str, query: str | None = None, label: str | None = None) -> int:
+        """Create the topic if needed; if a query is given, add it to the topic's queries."""
         row = self.conn.execute("SELECT id FROM topics WHERE name = ?", (name,)).fetchone()
         if row:
-            self.conn.execute("UPDATE topics SET query = ? WHERE id = ?", (query, row["id"]))
-            return row["id"]
-        cur = self.conn.execute(
-            "INSERT INTO topics (name, query, created) VALUES (?, ?, ?)", (name, query, _now())
+            topic_id = row["id"]
+        else:
+            # topics.query predates topic_queries and is no longer read; kept for old databases.
+            topic_id = self.conn.execute(
+                "INSERT INTO topics (name, query, created) VALUES (?, '', ?)", (name, _now())
+            ).lastrowid
+        if query:
+            self.add_query(topic_id, query, label)
+        return topic_id
+
+    def add_query(self, topic_id: int, query: str, label: str | None = None) -> str:
+        """Add a query to a topic, or replace the query under an existing label."""
+        label = label or query_label(query)
+        self.conn.execute(
+            """INSERT INTO topic_queries (topic_id, label, query, created) VALUES (?, ?, ?, ?)
+               ON CONFLICT (topic_id, label) DO UPDATE SET query = excluded.query""",
+            (topic_id, label, query, _now()),
         )
-        return cur.lastrowid
+        return label
+
+    def remove_query(self, topic_id: int, label: str) -> bool:
+        cur = self.conn.execute("DELETE FROM topic_queries WHERE topic_id = ? AND label = ?", (topic_id, label))
+        return cur.rowcount == 1
+
+    def queries(self, topic_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT label, query FROM topic_queries WHERE topic_id = ? ORDER BY id", (topic_id,)
+        ).fetchall()
 
     def topic_id(self, name: str) -> int:
         row = self.conn.execute("SELECT id FROM topics WHERE name = ?", (name,)).fetchone()
@@ -196,8 +242,9 @@ class Store:
 
     def topics(self) -> list[sqlite3.Row]:
         return self.conn.execute(
-            """SELECT t.name, t.query, t.created, COUNT(tp.paper_id) AS papers,
-                      SUM(tp.status = 'downloaded') AS downloaded
+            """SELECT t.name, t.created, COUNT(tp.paper_id) AS papers,
+                      SUM(tp.status = 'downloaded') AS downloaded,
+                      (SELECT COUNT(*) FROM topic_queries q WHERE q.topic_id = t.id) AS queries
                FROM topics t LEFT JOIN topic_papers tp ON tp.topic_id = t.id
                GROUP BY t.id ORDER BY t.name"""
         ).fetchall()

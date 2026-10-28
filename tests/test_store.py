@@ -84,3 +84,25 @@ def test_absolute_paths_from_a_moved_library_are_repaired(tmp_path):
     assert stored == "papers/arxiv_2001.00003/paper.pdf"
     assert s.resolve(stored).read_bytes() == b"%PDF-1.4"
     s.close()
+
+
+def test_topic_queries_are_kept_per_label(store):
+    t = store.upsert_topic("axspa", '"axial spondyloarthritis" secukinumab', label="il17")
+    store.upsert_topic("axspa", "upadacitinib spondyloarthritis")
+    store.add_query(t, '"axial spondyloarthritis" (secukinumab OR ixekizumab)', label="il17")  # replaces
+    assert [(q["label"], q["query"]) for q in store.queries(t)] == [
+        ("il17", '"axial spondyloarthritis" (secukinumab OR ixekizumab)'),
+        ("upadacitinib-spondyloarthritis", "upadacitinib spondyloarthritis"),
+    ]
+    assert store.remove_query(t, "il17") and not store.remove_query(t, "il17")
+
+
+def test_single_query_topics_from_older_versions_are_migrated(tmp_path):
+    s = Store(tmp_path / "old.db")
+    s.conn.execute("INSERT INTO topics (name, query, created) VALUES ('old', 'fourier neural operator', 't')")
+    s.commit()
+    s.close()
+    s = Store(tmp_path / "old.db")
+    t = s.topic_id("old")
+    assert [(q["label"], q["query"]) for q in s.queries(t)] == [("main", "fourier neural operator")]
+    s.close()

@@ -27,6 +27,68 @@ _CITES_OUT_WEIGHT = 0.3  # one outgoing link to the topic is worth 0.3 incoming 
 _MIN_SATURATION = 5.0  # small topics: don't let 2 links count as "maximally connected"
 
 
+# A parsed query is a list of AND-ed groups; a group is a list of OR-ed alternatives;
+# an alternative is the list of terms that must all appear (one word, or a phrase's words).
+Group = list[list[str]]
+Query = list[Group]
+_TOKEN = re.compile(r'"[^"]+"|[()]|[^\s()"]+')
+
+
+def term_sets(queries: list[str]) -> list[Query]:
+    """Parse a topic's queries for relevance scoring, one Query per alternative the topic
+    is looking for: its queries, and the parts of each query OR-ed at the top level.
+
+    '(ankylosing spondylitis OR axial spondyloarthritis) AND (secukinumab OR ixekizumab)'
+    becomes two groups, and a paper on ixekizumab in axial spondyloarthritis matches both
+    in full, instead of matching 3 of the query's 6 words. Terms after NOT are ignored."""
+    parsed = []
+    for query in queries:
+        for alternative in _split(_TOKEN.findall(query), "OR", top_level=True):
+            if groups := _groups(alternative):
+                parsed.append(groups)
+    return parsed
+
+
+def _split(tokens: list[str], op: str, top_level: bool = False) -> list[list[str]]:
+    parts: list[list[str]] = [[]]
+    depth = 0
+    for token in tokens:
+        depth += {"(": 1, ")": -1}.get(token, 0)
+        if token == op and (depth == 0 or not top_level):
+            parts.append([])
+        else:
+            parts[-1].append(token)
+    return [p for p in parts if p]
+
+
+def _groups(tokens: list[str]) -> Query:
+    groups: Query = []
+    i, negate = 0, False
+    while i < len(tokens):
+        token = tokens[i]
+        if token in ("AND", ")"):
+            i += 1
+            continue
+        if token in ("NOT", "ANDNOT"):
+            negate, i = True, i + 1
+            continue
+        if token == "(":
+            depth, j = 1, i + 1
+            while j < len(tokens) and depth:
+                depth += {"(": 1, ")": -1}.get(tokens[j], 0)
+                j += 1
+            inner = [t for t in tokens[i + 1:j] if t not in ("(", ")", "AND")]  # nesting flattened
+            group = [terms for alt in _split(inner, "OR") if (terms := query_terms(" ".join(alt)))]
+            i = j
+        else:
+            group = [terms] if (terms := query_terms(token)) else []
+            i += 1
+        if group and not negate:
+            groups.append(group)
+        negate = False
+    return groups
+
+
 def query_terms(query: str) -> list[str]:
     query = re.sub(r"\b[a-z_]+:", " ", query, flags=re.IGNORECASE)  # drop field prefixes
     words = re.findall(r"[a-z0-9][a-z0-9\-]+", query.lower())
@@ -37,14 +99,18 @@ def weighted_links(cited_in: int, cites_out: int) -> float:
     return cited_in + _CITES_OUT_WEIGHT * cites_out
 
 
-def score(terms: list[str], title: str, abstract: str | None, year: int | None,
+def score(queries: list[Query], title: str, abstract: str | None, year: int | None,
           cited_by: int | None, today: date | None = None, *,
           cited_in: int = 0, cites_out: int = 0, max_links: float = 20.0) -> float:
-    """`cited_in`: topic papers citing this one. `cites_out`: topic papers it cites.
+    """`queries`: from term_sets(); relevance is the best match among them.
+    `cited_in`: topic papers citing this one. `cites_out`: topic papers it cites.
     `max_links`: the topic's highest weighted_links, so the link term is relative to the
     topic's best-connected paper (in-degrees of 10 and 80 are both "core" in different topics)."""
     today = today or date.today()
-    relevance = 0.6 * _coverage(terms, title) + 0.4 * _coverage(terms, abstract or title)
+    relevance = max(
+        (0.6 * _coverage(q, title) + 0.4 * _coverage(q, abstract or title) for q in queries),
+        default=0.0,
+    )
 
     saturation = max(_MIN_SATURATION, max_links)
     topic_links = min(1.0, math.log1p(weighted_links(cited_in, cites_out)) / math.log1p(saturation))
@@ -64,11 +130,12 @@ def score(terms: list[str], title: str, abstract: str | None, year: int | None,
     )
 
 
-def _coverage(terms: list[str], text: str) -> float:
-    if not terms:
+def _coverage(query: Query, text: str) -> float:
+    """Share of the query's AND-ed groups that the text satisfies."""
+    if not query:
         return 0.0
     words = {_stem(w) for w in re.findall(r"[a-z0-9][a-z0-9\-]+", text.lower())}
-    return sum(t in words for t in terms) / len(terms)
+    return sum(any(all(t in words for t in alt) for alt in group) for group in query) / len(query)
 
 
 def _stem(word: str) -> str:

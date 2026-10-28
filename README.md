@@ -28,11 +28,15 @@ Environment variables (all optional):
 ## Usage
 
 ```powershell
-# Discover: query every source, merge duplicates, score, store
-scientia search neural-operators "fourier neural operator" --since 2020-01-01 --limit 50
+# Discover: query every source, merge duplicates, score, store. Each query is saved
+# under a label; a topic can have many (one per sub-question, drug class, mechanism...).
+scientia search axspa-treatment '("ankylosing spondylitis" OR "axial spondyloarthritis") AND (secukinumab OR ixekizumab)' --label il17 --limit 100
+scientia search axspa-treatment '("ankylosing spondylitis" OR "axial spondyloarthritis") AND (tofacitinib OR upadacitinib)' --label jak --limit 100
 
-# Re-run later with the saved query, newest first (only new papers are added)
-scientia search neural-operators --sort recent
+# Re-run all saved queries later, newest first (only new papers are added), or just one
+scientia search axspa-treatment --sort recent
+scientia search axspa-treatment --label jak
+scientia queries axspa-treatment              # list them; --remove <label> to drop one
 
 scientia list neural-operators --top 20
 
@@ -110,6 +114,19 @@ arXiv, Europe PMC and Unpaywall are free.
 
 A 25-seed `expand` costs well under a cent.
 
+## Queries
+
+All sources accept the same syntax: words, `"quoted phrases"`, `AND` / `OR` / `NOT` in
+capitals, and parentheses. Adjacent terms are AND-ed. The query is translated for arXiv,
+which needs a field prefix on every term. In OpenAlex, `*` is a wildcard, so write allele
+names like `HLA-B*27` as `"HLA-B27"`.
+
+A broad field needs several queries. "Ankylosing spondylitis" alone matches 52,000+ works,
+and the top 100 by relevance are mostly reviews. One query per drug class or mechanism
+reaches the primary research. For ranking, every query is an alternative. Within a query,
+each AND-ed part counts as matched if any of its OR-ed options appears. So a paper on
+ixekizumab in axial spondyloarthritis fully matches the `il17` query above.
+
 ## Citation expansion
 
 Keyword search misses foundational papers that use older terminology, and recent ones that
@@ -137,7 +154,7 @@ topic's most cited papers. The keyword search had found none of them.
 
 The stage-A score is in [0, 1] (`scientia/ranking.py`):
 
-- 0.45 × query match in title/abstract
+- 0.45 × query match in title/abstract (best-matching query, boolean-aware)
 - 0.25 × citation links within the topic: being cited by topic papers counts 1, citing one
   counts 0.3, scaled to the topic's best-connected paper
 - 0.15 × citation velocity

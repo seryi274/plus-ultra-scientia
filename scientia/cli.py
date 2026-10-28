@@ -1,6 +1,8 @@
 """Command-line interface.
 
-    scientia search <topic> "<query>" [--since 2023-01-01] [--limit 50] [--sources ...]
+    scientia search <topic> "<query>" [--label il17] [--since 2023-01-01] [--limit 50]
+    scientia search <topic>                  (re-run all of the topic's saved queries)
+    scientia queries <topic> [--remove <label>]
     scientia list   <topic> [--top 20] [--status new]
     scientia expand <topic> [--seeds 25] [--direction both] [--min-links 2]
     scientia fetch  <topic> [--top 10] [--min-score 0.5] [--allow-paid]
@@ -33,6 +35,8 @@ from scientia.sources.openalex import OpenAlex
 from scientia.store import Store, StoredPaper
 
 SOURCES = ("openalex", "arxiv", "europepmc")
+# OpenAlex work types that citation expansion never adds.
+SKIPPED_TYPES = ("editorial", "letter", "erratum", "paratext", "retraction", "peer-review")
 # Per-source spelling of the --sort choices; None means the source's relevance order.
 _SORT = {
     "openalex": {"recent": "publication_date:desc", "cited": "cited_by_count:desc"},
@@ -64,7 +68,10 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("search", help="discover papers for a topic and add them to the library")
     p.add_argument("topic", help="short topic name, e.g. neural-operators")
-    p.add_argument("query", nargs="?", help="search query (defaults to the topic's saved query)")
+    p.add_argument("query", nargs="?",
+                   help="query to add to the topic and run; omit to re-run all saved queries")
+    p.add_argument("--label", help="name for the query (default: derived from its text); "
+                                   "without a query, run only the saved query with this label")
     p.add_argument("--since", type=_iso_date, help="earliest publication date, YYYY-MM-DD")
     p.add_argument("--until", type=_iso_date, help="latest publication date, YYYY-MM-DD")
     p.add_argument("--limit", type=int, default=50, help="results per source (default 50)")
@@ -73,6 +80,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--sort", choices=("relevance", "recent", "cited"), default="relevance")
     p.add_argument("--show", type=int, default=15, help="how many top results to print")
     p.set_defaults(handler=cmd_search)
+
+    p = sub.add_parser("queries", help="show or remove a topic's saved queries")
+    p.add_argument("topic")
+    p.add_argument("--remove", metavar="LABEL", help="remove the query with this label")
+    p.set_defaults(handler=cmd_queries)
 
     p = sub.add_parser("list", help="show a topic's papers, best first")
     p.add_argument("topic")
@@ -92,9 +104,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="add a paper only if linked to at least this many seeds/topic papers (default 2)")
     p.add_argument("--max-new", type=int, default=50, help="cap on papers added per direction (default 50)")
     p.add_argument("--since", type=_iso_date, help="forward only: citing papers published from this date")
-    p.add_argument("--skip-types", default="editorial,letter,erratum,paratext,retraction,peer-review",
-                   help="OpenAlex work types never added (comma-separated; add 'review' to keep only "
-                        "primary research). Default: %(default)s")
+    p.add_argument("--skip-types", default="",
+                   help="extra OpenAlex work types to leave out, comma-separated; e.g. 'review' to add "
+                        f"only primary research. Always left out: {','.join(SKIPPED_TYPES)}")
     p.add_argument("--show", type=int, default=15)
     p.set_defaults(handler=cmd_expand)
 
@@ -139,14 +151,18 @@ def _parser() -> argparse.ArgumentParser:
 # -- commands -------------------------------------------------------------------
 
 def cmd_search(args, config: Config, store: Store, http: HttpClient) -> int:
-    query = args.query
-    if not query:
-        row = store.conn.execute("SELECT query FROM topics WHERE name = ?", (args.topic,)).fetchone()
-        if not row:
-            print("error: a new topic needs a query", file=sys.stderr)
+    if args.query:
+        topic_id = store.upsert_topic(args.topic)
+        label = store.add_query(topic_id, args.query, args.label)
+        to_run = [(label, args.query)]
+    else:
+        topic_id = store.topic_id(args.topic)
+        to_run = [(q["label"], q["query"]) for q in store.queries(topic_id)
+                  if not args.label or q["label"] == args.label]
+        if not to_run:
+            what = f"query labelled {args.label!r}" if args.label else "saved queries"
+            print(f"error: topic '{args.topic}' has no {what}", file=sys.stderr)
             return 2
-        query = row["query"]
-    topic_id = store.upsert_topic(args.topic, query)
 
     clients = {
         "openalex": OpenAlex(http, config.openalex_api_key),
@@ -161,36 +177,56 @@ def cmd_search(args, config: Config, store: Store, http: HttpClient) -> int:
         print("note: OPENALEX_API_KEY is not set; sharing the anonymous $0.10/day budget.")
 
     new_total = 0
-    for name in wanted:
-        params = {"limit": args.limit, "since": args.since, "until": args.until,
-                  "sort": _SORT[name].get(args.sort)}
-        try:
-            papers = clients[name].search(query, **params)
-        except Exception as exc:  # one source being down should not sink the others
-            store.log_search(topic_id, name, query, params, 0, error=str(exc))
+    for label, query in to_run:
+        print(f"[{label}] {query}")
+        for name in wanted:
+            params = {"limit": args.limit, "since": args.since, "until": args.until,
+                      "sort": _SORT[name].get(args.sort), "label": label}
+            try:
+                papers = clients[name].search(query, **{k: v for k, v in params.items() if k != "label"})
+            except Exception as exc:  # one source being down should not sink the others
+                store.log_search(topic_id, name, query, params, 0, error=str(exc))
+                store.commit()
+                print(f"  {name:<10} failed: {exc}")
+                continue
+            new_here = 0
+            for paper in papers:
+                paper_id, _ = store.add_paper(paper)
+                new_here += store.link(topic_id, paper_id)
+            store.log_search(topic_id, name, query, params, len(papers))
             store.commit()
-            print(f"  {name:<10} failed: {exc}")
-            continue
-        new_here = 0
-        for paper in papers:
-            paper_id, _ = store.add_paper(paper)
-            new_here += store.link(topic_id, paper_id)
-        store.log_search(topic_id, name, query, params, len(papers))
-        store.commit()
-        new_total += new_here
-        print(f"  {name:<10} {len(papers):>4} results, {new_here:>4} new to topic")
+            new_total += new_here
+            print(f"  {name:<10} {len(papers):>4} results, {new_here:>4} new to topic")
 
-    _rescore(store, topic_id, query)
+    _rescore(store, topic_id)
     store.commit()
-    print(f"\n{new_total} new papers in '{args.topic}'. Top {args.show}:\n")
-    _print_table(store, topic_id, store.topic_papers(topic_id, limit=args.show))
+    print(f"\n{new_total} new papers in '{args.topic}'.")
+    if args.show > 0:
+        print(f"Top {args.show}:\n")
+        _print_table(store, topic_id, store.topic_papers(topic_id, limit=args.show))
+    return 0
+
+
+def cmd_queries(args, config: Config, store: Store, http: HttpClient) -> int:
+    topic_id = store.topic_id(args.topic)
+    if args.remove:
+        if not store.remove_query(topic_id, args.remove):
+            print(f"error: no query labelled {args.remove!r}", file=sys.stderr)
+            return 2
+        _rescore(store, topic_id)
+        store.commit()
+        print(f"Removed [{args.remove}]. Papers it found stay in the topic.")
+    rows = store.queries(topic_id)
+    if not rows:
+        print(f"'{args.topic}' has no queries. Add one with: scientia search {args.topic} \"<query>\"")
+    for q in rows:
+        print(f"  {q['label']:<32} {q['query']}")
     return 0
 
 
 def cmd_list(args, config: Config, store: Store, http: HttpClient) -> int:
     topic_id = store.topic_id(args.topic)
-    query = store.conn.execute("SELECT query FROM topics WHERE id = ?", (topic_id,)).fetchone()["query"]
-    _rescore(store, topic_id, query)  # cheap, and keeps scores in step with citation data
+    _rescore(store, topic_id)  # cheap, and keeps scores in step with citation data
     store.commit()
     papers = store.topic_papers(topic_id, status=args.status)
     if args.sort != "score":
@@ -201,24 +237,23 @@ def cmd_list(args, config: Config, store: Store, http: HttpClient) -> int:
 
 def cmd_expand(args, config: Config, store: Store, http: HttpClient) -> int:
     topic_id = store.topic_id(args.topic)
-    query = store.conn.execute("SELECT query FROM topics WHERE id = ?", (topic_id,)).fetchone()["query"]
     openalex = OpenAlex(http, config.openalex_api_key)
     params = {"seeds": args.seeds, "direction": args.direction, "min_links": args.min_links,
               "max_new": args.max_new, "since": args.since,
-              "skip_types": [t.strip() for t in args.skip_types.split(",") if t.strip()]}
+              "skip_types": [*SKIPPED_TYPES, *(t.strip() for t in args.skip_types.split(",") if t.strip())]}
     # Score with current citation links first, so the seeds are the topic's best papers.
-    _rescore(store, topic_id, query)
+    _rescore(store, topic_id)
     try:
         result = expand(store, openalex, topic_id, **params)
     except Exception as exc:
         store.commit()  # keep whatever was resolved before the failure
-        store.log_search(topic_id, "openalex-expand", query, params, 0, error=str(exc))
+        store.log_search(topic_id, "openalex-expand", "citation expansion", params, 0, error=str(exc))
         store.commit()
         print(f"error: expansion failed: {exc}", file=sys.stderr)
         return 1
     added = result.added["backward"] + result.added["forward"]
-    store.log_search(topic_id, "openalex-expand", query, params, len(added))
-    _rescore(store, topic_id, query)
+    store.log_search(topic_id, "openalex-expand", "citation expansion", params, len(added))
+    _rescore(store, topic_id)
     store.commit()
 
     print(f"Matched {result.resolved} more topic papers to OpenAlex"
@@ -230,7 +265,7 @@ def cmd_expand(args, config: Config, store: Store, http: HttpClient) -> int:
     if args.direction in ("both", "forward"):
         print(f"  forward   {result.forward_candidates:>4} candidates, {len(result.added['forward']):>3} added")
     print(f"OpenAlex cost: ${openalex.cost_usd:.4f}")
-    if added:
+    if added and args.show > 0:
         newly = [p for p in store.topic_papers(topic_id) if p.id in set(added)][: args.show]
         print(f"\nTop new papers:\n")
         _print_table(store, topic_id, newly, notes=True)
@@ -299,7 +334,6 @@ def cmd_import(args, config: Config, store: Store, http: HttpClient) -> int:
 
 def cmd_report(args, config: Config, store: Store, http: HttpClient) -> int:
     topic_id = store.topic_id(args.topic)
-    query = store.conn.execute("SELECT query FROM topics WHERE id = ?", (topic_id,)).fetchone()["query"]
     out_dir = config.topics_dir / _slug(args.topic)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "reading-list.md"
@@ -336,7 +370,8 @@ def cmd_report(args, config: Config, store: Store, http: HttpClient) -> int:
         ("Not fetched yet", store.topic_papers(topic_id, status="new", limit=args.pending), False),
         ("Read", store.topic_papers(topic_id, status="read"), True),
     ]
-    parts = [f"# {args.topic}", f"Query: `{query}` · generated {date.today().isoformat()}"]
+    queries = "\n".join(f"- **{q['label']}**: `{q['query']}`" for q in store.queries(topic_id))
+    parts = [f"# {args.topic}", f"Generated {date.today().isoformat()} from these queries:\n\n{queries}"]
     core = [p for p in _view(store, topic_id, store.topic_papers(topic_id), "foundational")[:10]
             if topic_links.get(p.id, (0, 0))[0] > 0]
     if core:
@@ -386,14 +421,15 @@ def cmd_topics(args, config: Config, store: Store, http: HttpClient) -> int:
     if not rows:
         print("No topics yet. Start one with: scientia search <topic> \"<query>\"")
     for r in rows:
-        print(f"{r['name']:<28} {r['papers']:>5} papers  {r['downloaded'] or 0:>4} downloaded   {r['query']}")
+        print(f"{r['name']:<28} {r['papers']:>5} papers  {r['downloaded'] or 0:>4} downloaded  "
+              f"{r['queries']:>2} queries")
     return 0
 
 
 # -- helpers --------------------------------------------------------------------
 
-def _rescore(store: Store, topic_id: int, query: str) -> None:
-    terms = ranking.query_terms(query)
+def _rescore(store: Store, topic_id: int) -> None:
+    terms = ranking.term_sets([q["query"] for q in store.queries(topic_id)])
     links = store.topic_links(topic_id)
     max_links = max((ranking.weighted_links(*l) for l in links.values()), default=0.0)
     for p in store.topic_papers(topic_id):

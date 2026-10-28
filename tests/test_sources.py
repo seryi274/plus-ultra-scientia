@@ -112,3 +112,12 @@ def test_semanticscholar_pdf_field():
     assert _pdf({"openAccessPdf": {"url": "https://x/a.pdf", "license": "CCBY"}}) == ("https://x/a.pdf", "CCBY")
     assert _pdf({"openAccessPdf": {"url": "", "status": "CLOSED"}}) is None
     assert _pdf({}) is None
+
+
+def test_arxiv_query_translates_boolean_syntax():
+    assert build_query('"ankylosing spondylitis" OR "axial spondyloarthritis"') == (
+        'all:"ankylosing spondylitis" OR all:"axial spondyloarthritis"'
+    )
+    assert build_query("(il-17 OR il-23) spondyloarthritis NOT psoriasis") == (
+        "(all:il-17 OR all:il-23) AND all:spondyloarthritis ANDNOT all:psoriasis"
+    )

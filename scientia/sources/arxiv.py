@@ -62,13 +62,28 @@ class Arxiv:
 
 
 def build_query(query: str, since: str | None = None, until: str | None = None) -> str:
-    """Turn free text into an AND of terms across all fields. A query that already uses
+    """Translate the query syntax shared with OpenAlex and Europe PMC (words, "quoted
+    phrases", AND / OR / NOT, parentheses; adjacent terms are AND-ed) into arXiv's, where
+    every term needs a field prefix and NOT is spelled ANDNOT. A query that already uses
     arXiv field syntax (e.g. 'ti:transformer AND cat:cs.LG') is passed through."""
     if re.search(r"\b(ti|au|abs|co|jr|cat|rn|id|all):", query):
         q = query
     else:
-        terms = re.findall(r'"[^"]+"|\S+', query)
-        q = " AND ".join(f"all:{t}" for t in terms)
+        parts: list[str] = []
+        after_term = False  # an implicit AND goes between two terms
+        for token in re.findall(r'"[^"]+"|[()]|[^\s()"]+', query):
+            if token in ("AND", "OR", "NOT", "ANDNOT"):
+                parts.append("ANDNOT" if token == "NOT" else token)
+                after_term = False
+            elif token == ")":
+                parts.append(token)
+                after_term = True
+            else:
+                if after_term:
+                    parts.append("AND")
+                parts.append(token if token == "(" else f"all:{token}")
+                after_term = token != "("
+        q = " ".join(parts).replace("( ", "(").replace(" )", ")")
     if since or until:
         lo = (since or "1991-01-01").replace("-", "") + "0000"
         hi = (until or "2999-12-31").replace("-", "") + "2359"
