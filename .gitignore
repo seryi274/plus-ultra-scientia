@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.idea/
+.env
+
+# Downloaded papers and the local database: licensed content must not be committed.
+library/
