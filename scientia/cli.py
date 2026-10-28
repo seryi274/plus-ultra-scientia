@@ -2,6 +2,7 @@
 
     scientia search <topic> "<query>" [--since 2023-01-01] [--limit 50] [--sources ...]
     scientia list   <topic> [--top 20] [--status new]
+    scientia expand <topic> [--seeds 25] [--direction both] [--min-links 2]
     scientia fetch  <topic> [--top 10] [--min-score 0.5] [--allow-paid]
     scientia import [pdfs or folders] [--topic <topic>] [--move]
     scientia report <topic>
@@ -23,6 +24,7 @@ from pathlib import Path
 from scientia import ranking
 from scientia.acquire import Acquirer
 from scientia.config import Config
+from scientia.expand import expand
 from scientia.importer import Importer, pdf_files
 from scientia.net import HttpClient
 from scientia.sources.arxiv import Arxiv
@@ -33,7 +35,7 @@ from scientia.store import Store, StoredPaper
 SOURCES = ("openalex", "arxiv", "europepmc")
 # Per-source spelling of the --sort choices; None means the source's relevance order.
 _SORT = {
-    "openalex": {"recent": "-publication_date", "cited": "-cited_by_count"},
+    "openalex": {"recent": "publication_date:desc", "cited": "cited_by_count:desc"},
     "arxiv": {"recent": "recent"},
     "europepmc": {"recent": "recent", "cited": "cited"},
 }
@@ -76,7 +78,25 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("topic")
     p.add_argument("--top", type=int, default=20)
     p.add_argument("--status", choices=("new", "downloaded", "unavailable", "read", "skipped"))
+    p.add_argument("--sort", choices=("score", "foundational", "frontier", "recent"), default="score",
+                   help="foundational = most cited by the topic's papers; frontier = recent papers "
+                        "citing the most topic papers; recent = newest first")
     p.set_defaults(handler=cmd_list)
+
+    p = sub.add_parser("expand", help="follow citations from the topic's best papers (OpenAlex)")
+    p.add_argument("topic")
+    p.add_argument("--seeds", type=int, default=25, help="top-scoring papers to expand from (default 25)")
+    p.add_argument("--direction", choices=("both", "backward", "forward"), default="both",
+                   help="backward = what seeds cite (foundations); forward = what cites them (frontier)")
+    p.add_argument("--min-links", type=int, default=2,
+                   help="add a paper only if linked to at least this many seeds/topic papers (default 2)")
+    p.add_argument("--max-new", type=int, default=50, help="cap on papers added per direction (default 50)")
+    p.add_argument("--since", type=_iso_date, help="forward only: citing papers published from this date")
+    p.add_argument("--skip-types", default="editorial,letter,erratum,paratext,retraction,peer-review",
+                   help="OpenAlex work types never added (comma-separated; add 'review' to keep only "
+                        "primary research). Default: %(default)s")
+    p.add_argument("--show", type=int, default=15)
+    p.set_defaults(handler=cmd_expand)
 
     p = sub.add_parser("fetch", help="download open-access full text for the top papers")
     p.add_argument("topic")
@@ -163,12 +183,57 @@ def cmd_search(args, config: Config, store: Store, http: HttpClient) -> int:
     _rescore(store, topic_id, query)
     store.commit()
     print(f"\n{new_total} new papers in '{args.topic}'. Top {args.show}:\n")
-    _print_table(store.topic_papers(topic_id, limit=args.show))
+    _print_table(store, topic_id, store.topic_papers(topic_id, limit=args.show))
     return 0
 
 
 def cmd_list(args, config: Config, store: Store, http: HttpClient) -> int:
-    _print_table(store.topic_papers(store.topic_id(args.topic), status=args.status, limit=args.top))
+    topic_id = store.topic_id(args.topic)
+    query = store.conn.execute("SELECT query FROM topics WHERE id = ?", (topic_id,)).fetchone()["query"]
+    _rescore(store, topic_id, query)  # cheap, and keeps scores in step with citation data
+    store.commit()
+    papers = store.topic_papers(topic_id, status=args.status)
+    if args.sort != "score":
+        papers = _view(store, topic_id, papers, args.sort)
+    _print_table(store, topic_id, papers[: args.top])
+    return 0
+
+
+def cmd_expand(args, config: Config, store: Store, http: HttpClient) -> int:
+    topic_id = store.topic_id(args.topic)
+    query = store.conn.execute("SELECT query FROM topics WHERE id = ?", (topic_id,)).fetchone()["query"]
+    openalex = OpenAlex(http, config.openalex_api_key)
+    params = {"seeds": args.seeds, "direction": args.direction, "min_links": args.min_links,
+              "max_new": args.max_new, "since": args.since,
+              "skip_types": [t.strip() for t in args.skip_types.split(",") if t.strip()]}
+    # Score with current citation links first, so the seeds are the topic's best papers.
+    _rescore(store, topic_id, query)
+    try:
+        result = expand(store, openalex, topic_id, **params)
+    except Exception as exc:
+        store.commit()  # keep whatever was resolved before the failure
+        store.log_search(topic_id, "openalex-expand", query, params, 0, error=str(exc))
+        store.commit()
+        print(f"error: expansion failed: {exc}", file=sys.stderr)
+        return 1
+    added = result.added["backward"] + result.added["forward"]
+    store.log_search(topic_id, "openalex-expand", query, params, len(added))
+    _rescore(store, topic_id, query)
+    store.commit()
+
+    print(f"Matched {result.resolved} more topic papers to OpenAlex"
+          + (f" ({result.unresolved} have no OpenAlex record)" if result.unresolved else "")
+          + f"; refreshed references of {result.refreshed} records.")
+    print(f"Expanded from {result.seeds} seeds (min {args.min_links} links):")
+    if args.direction in ("both", "backward"):
+        print(f"  backward  {result.backward_candidates:>4} candidates, {len(result.added['backward']):>3} added")
+    if args.direction in ("both", "forward"):
+        print(f"  forward   {result.forward_candidates:>4} candidates, {len(result.added['forward']):>3} added")
+    print(f"OpenAlex cost: ${openalex.cost_usd:.4f}")
+    if added:
+        newly = [p for p in store.topic_papers(topic_id) if p.id in set(added)][: args.show]
+        print(f"\nTop new papers:\n")
+        _print_table(store, topic_id, newly, notes=True)
     return 0
 
 
@@ -239,11 +304,15 @@ def cmd_report(args, config: Config, store: Store, http: HttpClient) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "reading-list.md"
 
+    topic_links = store.topic_links(topic_id)
+
     def entry(p: StoredPaper, with_file: bool) -> str:
         authors = ", ".join(p.authors[:3]) + (" et al." if len(p.authors) > 3 else "")
-        lines = [f"### {p.title}",
+        cited_in, cites_out = topic_links.get(p.id, (0, 0))
+        lines = [f"### {p.tags + ' ' if p.tags else ''}{p.title}",
                  f"{authors or 'Unknown authors'} · {p.year or 'n.d.'} · {p.venue or '-'} · "
-                 f"cited {p.cited_by or 0} · score {p.score:.2f} · id {p.id}"]
+                 f"cited {p.cited_by or 0} · cited by {cited_in} / cites {cites_out} topic papers · "
+                 f"score {p.score:.2f} · id {p.id}"]
         links = []
         if with_file:
             for kind, row in store.files(p.id).items():
@@ -268,6 +337,15 @@ def cmd_report(args, config: Config, store: Store, http: HttpClient) -> int:
         ("Read", store.topic_papers(topic_id, status="read"), True),
     ]
     parts = [f"# {args.topic}", f"Query: `{query}` · generated {date.today().isoformat()}"]
+    core = [p for p in _view(store, topic_id, store.topic_papers(topic_id), "foundational")[:10]
+            if topic_links.get(p.id, (0, 0))[0] > 0]
+    if core:
+        parts.append("## Core papers (most cited within this topic)")
+        parts.append("\n".join(
+            f"{i}. {p.tags + ' ' if p.tags else ''}{p.title} ({p.year or 'n.d.'}) — cited by "
+            f"{topic_links[p.id][0]} topic papers · id {p.id} · {p.status}"
+            for i, p in enumerate(core, 1)
+        ))
     for title, papers, with_file in sections:
         if papers:
             parts.append(f"## {title} ({len(papers)})")
@@ -316,19 +394,45 @@ def cmd_topics(args, config: Config, store: Store, http: HttpClient) -> int:
 
 def _rescore(store: Store, topic_id: int, query: str) -> None:
     terms = ranking.query_terms(query)
+    links = store.topic_links(topic_id)
+    max_links = max((ranking.weighted_links(*l) for l in links.values()), default=0.0)
     for p in store.topic_papers(topic_id):
-        store.set_score(topic_id, p.id, ranking.score(terms, p.title, p.abstract, p.year, p.cited_by))
+        cited_in, cites_out = links.get(p.id, (0, 0))
+        store.set_score(topic_id, p.id, ranking.score(terms, p.title, p.abstract, p.year, p.cited_by,
+                                                      cited_in=cited_in, cites_out=cites_out,
+                                                      max_links=max_links))
 
 
-def _print_table(papers: list[StoredPaper]) -> None:
+def _view(store: Store, topic_id: int, papers: list[StoredPaper], view: str) -> list[StoredPaper]:
+    """Reorder papers for one reading purpose instead of the blended score."""
+    links = store.topic_links(topic_id)
+    if view == "foundational":
+        return sorted(papers, key=lambda p: (-links.get(p.id, (0, 0))[0], -p.score))
+    if view == "frontier":
+        # Papers from the last three years, most connected to the topic first.
+        horizon = date.today().year - 3
+        recent = [p for p in papers if (p.year or 0) >= horizon]
+        return sorted(recent, key=lambda p: (-links.get(p.id, (0, 0))[1], -p.score))
+    if view == "recent":
+        return sorted(papers, key=lambda p: (p.published or str(p.year or ""), p.score), reverse=True)
+    return papers
+
+
+def _print_table(store: Store, topic_id: int, papers: list[StoredPaper], notes: bool = False) -> None:
+    """`links` is in/out: topic papers citing this one / topic papers it cites."""
     if not papers:
         print("(no papers)")
         return
-    print(f"{'id':>5}  {'score':>5}  {'year':>4}  {'cites':>6}  {'status':<11} {'full text':<9}  title")
+    links = store.topic_links(topic_id)
+    print(f"{'id':>5}  {'score':>5}  {'year':>4}  {'cites':>6}  {'links':>5}  {'status':<11} {'full text':<9}  title")
     for p in papers:
         access = "arXiv" if p.arxiv_id else ("OA" if p.is_oa else ("cached" if p.openalex_has_pdf else "-"))
-        print(f"{p.id:>5}  {p.score:>5.2f}  {p.year or '':>4}  {p.cited_by or 0:>6}  "
-              f"{p.status:<11} {access:<9}  {_clip(p.title, 70)}")
+        cited_in, cites_out = links.get(p.id, (0, 0))
+        title = f"{p.tags} {p.title}" if p.tags else p.title
+        print(f"{p.id:>5}  {p.score:>5.2f}  {p.year or '':>4}  {p.cited_by or 0:>6}  {f'{cited_in}/{cites_out}':>5}  "
+              f"{p.status:<11} {access:<9}  {_clip(title, 70)}")
+        if notes and p.note:
+            print(f"{'':>56}{p.note}")
 
 
 def _clip(text: str, width: int) -> str:

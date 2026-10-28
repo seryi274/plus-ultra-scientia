@@ -35,6 +35,12 @@ scientia search neural-operators "fourier neural operator" --since 2020-01-01 --
 scientia search neural-operators --sort recent
 
 scientia list neural-operators --top 20
+
+# Follow citations from the 25 best papers: what they cite, and what cites them
+scientia expand neural-operators --seeds 25
+scientia list neural-operators --sort foundational   # most cited within the topic
+scientia list neural-operators --sort frontier       # last 3 years, most connected to the topic
+
 scientia fetch neural-operators --top 10 -v   # download open-access PDFs / XML
 scientia report neural-operators              # <library>/topics/neural-operators/reading-list.md
 scientia import --move                        # file PDFs you saved into <library>/inbox/
@@ -102,16 +108,51 @@ A search costs $0.001 per call (up to 100 results). Single-record lookups are fr
 PDF costs $0.01. A typical `search` with three sources spends about $0.001 of OpenAlex budget.
 arXiv, Europe PMC and Unpaywall are free.
 
+A 25-seed `expand` costs well under a cent.
+
+## Citation expansion
+
+Keyword search misses foundational papers that use older terminology, and recent ones that
+use new terminology. `expand` takes the topic's best papers as seeds and follows citations
+both ways through OpenAlex:
+
+- **Backward** adds works cited by at least `--min-links` seeds (default 2): foundations.
+- **Forward** adds works that cite at least `--min-links` topic papers: the frontier.
+
+Each direction adds at most `--max-new` papers (default 50), most connected first, with a note
+saying why each was added. Editorials, letters and errata are skipped (`--skip-types`; add
+`review` to keep only primary research). Every run is one more snowball step outwards: a
+second run starts from the grown topic and reaches further.
+
+Citation edges are stored for every OpenAlex record the tool sees, including search results.
+OpenAlex sometimes splits one paper into several records (preprint, conference and journal
+versions), each with part of the citations. Every OpenAlex id is mapped to a single paper,
+so each paper is counted once.
+
+It works for any field OpenAlex covers. On a GLP-1 cardiovascular-outcomes topic, one
+expansion surfaced the eight landmark outcome trials (LEADER, SUSTAIN-6, REWIND…) as the
+topic's most cited papers. The keyword search had found none of them.
+
 ## Ranking
 
-The stage-A score is in [0, 1]: 0.6 × query match in title/abstract + 0.25 × citation
-velocity + 0.15 × recency (`scientia/ranking.py`). It is deliberately cheap and transparent.
-Embedding similarity and LLM relevance judgements belong on the shortlist that this score
-produces.
+The stage-A score is in [0, 1] (`scientia/ranking.py`):
+
+- 0.45 × query match in title/abstract
+- 0.25 × citation links within the topic: being cited by topic papers counts 1, citing one
+  counts 0.3, scaled to the topic's best-connected paper
+- 0.15 × citation velocity
+- 0.15 × recency
+
+It is deliberately cheap and transparent. Its known weakness is literal query matching: a
+trial titled "Liraglutide and…" doesn't match "GLP-1 receptor agonists". Embedding similarity
+and LLM relevance judgements belong on the shortlist this score produces. Until then, use
+`list --sort foundational` and `--sort frontier` for those two reading purposes. Reading
+lists open with a *Core papers* section.
+
+Papers are tagged `[RETRACTED]` (from OpenAlex) and `[review]`, `[editorial]`… by work type.
 
 ## Next steps
 
-- Citation expansion via OpenAlex (`referenced_works`, `cites:` filter) to find foundational and follow-up work.
 - Embedding-based re-ranking and LLM relevance review with structured output.
 - Structured extraction per paper (problem, methods, assumptions, claims with locations, limitations).
 - Scheduled monitoring (weekly `search --sort recent` plus a digest).

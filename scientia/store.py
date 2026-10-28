@@ -88,11 +88,36 @@ CREATE TABLE IF NOT EXISTS files (
     retrieved_at  TEXT NOT NULL,
     UNIQUE (paper_id, kind)
 );
+
+-- OpenAlex sometimes holds one paper as several works (preprint, conference and journal
+-- versions), each with its own citations. Every OpenAlex id seen for a paper maps here.
+CREATE TABLE IF NOT EXISTS openalex_aliases (
+    openalex_id  TEXT PRIMARY KEY,
+    paper_id     INTEGER NOT NULL REFERENCES papers(id)
+);
+CREATE INDEX IF NOT EXISTS openalex_aliases_paper ON openalex_aliases(paper_id);
+
+-- Citation edges between OpenAlex works, kept even when the cited work is not in the
+-- library: they are what citation expansion counts.
+CREATE TABLE IF NOT EXISTS citations (
+    citing  TEXT NOT NULL,
+    cited   TEXT NOT NULL,
+    PRIMARY KEY (citing, cited)
+);
+CREATE INDEX IF NOT EXISTS citations_cited ON citations(cited);
 """
+
+# Columns added after the first release, applied to existing databases on open.
+_ADDED_COLUMNS = {"papers": [("work_type", "TEXT"), ("is_retracted", "INTEGER")]}
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 def _journal_doi(doi: str | None) -> bool:
@@ -114,6 +139,16 @@ class StoredPaper:
             return json.loads(value)
         return value
 
+    @property
+    def tags(self) -> str:
+        """Short markers for listings: retraction and non-research work types."""
+        tags = []
+        if self.row["is_retracted"]:
+            tags.append("[RETRACTED]")
+        if self.row["work_type"] in ("review", "editorial", "letter", "erratum", "retraction"):
+            tags.append(f"[{self.row['work_type']}]")
+        return " ".join(tags)
+
 
 class Store:
     def __init__(self, path: Path):
@@ -123,7 +158,20 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(_SCHEMA)
+        self._add_missing_columns()
+        self.conn.execute(
+            "INSERT OR IGNORE INTO openalex_aliases (openalex_id, paper_id)"
+            " SELECT openalex_id, id FROM papers WHERE openalex_id IS NOT NULL"
+        )
+        self.conn.commit()
         self._relativize_file_paths()
+
+    def _add_missing_columns(self) -> None:
+        for table, columns in _ADDED_COLUMNS.items():
+            existing = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns:
+                if name not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -168,12 +216,21 @@ class Store:
         """Insert or merge a paper. Returns (paper_id, created)."""
         matches = self._find_matches(paper)
         if not matches:
-            return self._insert(paper), True
-        keep, *duplicates = sorted(matches)
-        for dup in duplicates:
-            self._absorb(keep, dup)
-        self._merge_into(keep, paper)
-        return keep, False
+            paper_id, created = self._insert(paper), True
+        else:
+            paper_id, *duplicates = sorted(matches)
+            for dup in duplicates:
+                self._absorb(paper_id, dup)
+            self._merge_into(paper_id, paper)
+            created = False
+        if paper.openalex_id:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO openalex_aliases (openalex_id, paper_id) VALUES (?, ?)",
+                (paper.openalex_id, paper_id),
+            )
+            if paper.references is not None:
+                self.set_references(paper.openalex_id, paper.references)
+        return paper_id, created
 
     def _find_matches(self, paper: Paper) -> set[int]:
         ids = set()
@@ -181,6 +238,12 @@ class Store:
             row = self.conn.execute(f"SELECT id FROM papers WHERE {column} = ?", (value,)).fetchone()
             if row:
                 ids.add(row["id"])
+        if paper.openalex_id:
+            row = self.conn.execute(
+                "SELECT paper_id FROM openalex_aliases WHERE openalex_id = ?", (paper.openalex_id,)
+            ).fetchone()
+            if row:
+                ids.add(row["paper_id"])
         key = title_key(paper.title)
         if not ids and paper.year and len(key.split()) >= 4:
             # Same title within a year either way: usually preprint vs. published version.
@@ -200,12 +263,13 @@ class Store:
         cur = self.conn.execute(
             """INSERT INTO papers (title, title_key, abstract, authors, year, published, venue,
                    doi, arxiv_id, pmid, pmcid, openalex_id, cited_by, is_oa, license, pdf_urls,
-                   openalex_has_pdf, landing_url, sources, first_seen, updated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   openalex_has_pdf, landing_url, sources, first_seen, updated, work_type, is_retracted)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (p.title, title_key(p.title), p.abstract, json.dumps(p.authors), p.year, p.published,
              p.venue, p.doi, p.arxiv_id, p.pmid, p.pmcid, p.openalex_id, p.cited_by,
              None if p.is_oa is None else int(p.is_oa), p.license, json.dumps(p.pdf_urls),
-             int(p.openalex_has_pdf), p.landing_url, json.dumps([p.source]), now, now),
+             int(p.openalex_has_pdf), p.landing_url, json.dumps([p.source]), now, now,
+             p.work_type, None if p.is_retracted is None else int(p.is_retracted)),
         )
         return cur.lastrowid
 
@@ -213,7 +277,8 @@ class Store:
         """Fill gaps in the stored record from a new sighting of the same paper."""
         row = self.conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         updates: dict[str, Any] = {}
-        for column in (*ID_COLUMNS, "abstract", "year", "published", "venue", "license", "landing_url"):
+        for column in (*ID_COLUMNS, "abstract", "year", "published", "venue", "license", "landing_url",
+                       "work_type"):
             value = getattr(p, column)
             if row[column] is None and value is not None:
                 updates[column] = value
@@ -225,6 +290,8 @@ class Store:
             updates["is_oa"] = 1
         if p.openalex_has_pdf and not row["openalex_has_pdf"]:
             updates["openalex_has_pdf"] = 1
+        if p.is_retracted is not None and (p.is_retracted or row["is_retracted"] is None):
+            updates["is_retracted"] = int(p.is_retracted)  # a retraction is sticky
         urls = json.loads(row["pdf_urls"])
         if new := [u for u in p.pdf_urls if u not in urls]:
             updates["pdf_urls"] = json.dumps(urls + new)
@@ -254,6 +321,7 @@ class Store:
         self.conn.execute("DELETE FROM topic_papers WHERE paper_id = ?", (dup,))
         self.conn.execute("UPDATE OR IGNORE files SET paper_id = ? WHERE paper_id = ?", (keep, dup))
         self.conn.execute("DELETE FROM files WHERE paper_id = ?", (dup,))
+        self.conn.execute("UPDATE openalex_aliases SET paper_id = ? WHERE paper_id = ?", (keep, dup))
         self.conn.execute("DELETE FROM papers WHERE id = ?", (dup,))
         sources = json.loads(dup_row["sources"])
         self._merge_into(keep, Paper(
@@ -265,6 +333,8 @@ class Store:
             cited_by=dup_row["cited_by"], is_oa=bool(dup_row["is_oa"]), license=dup_row["license"],
             pdf_urls=json.loads(dup_row["pdf_urls"]),
             openalex_has_pdf=bool(dup_row["openalex_has_pdf"]), landing_url=dup_row["landing_url"],
+            work_type=dup_row["work_type"],
+            is_retracted=None if dup_row["is_retracted"] is None else bool(dup_row["is_retracted"]),
         ))
 
     def link(self, topic_id: int, paper_id: int) -> bool:
@@ -341,6 +411,59 @@ class Store:
             (paper_id,),
         )
         return cur.rowcount
+
+    def set_note(self, topic_id: int, paper_id: int, note: str) -> None:
+        self.conn.execute(
+            "UPDATE topic_papers SET note = ? WHERE topic_id = ? AND paper_id = ?", (note, topic_id, paper_id)
+        )
+
+    # -- citations ----------------------------------------------------------------
+
+    def set_references(self, citing: str, cited: list[str]) -> None:
+        """Replace the stored reference list of one OpenAlex work."""
+        self.conn.execute("DELETE FROM citations WHERE citing = ?", (citing,))
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO citations (citing, cited) VALUES (?, ?)", [(citing, c) for c in cited]
+        )
+
+    def references_of(self, openalex_ids: list[str]) -> dict[str, list[str]]:
+        refs: dict[str, list[str]] = {i: [] for i in openalex_ids}
+        for chunk in _chunks(openalex_ids, 500):
+            marks = ",".join("?" * len(chunk))
+            for row in self.conn.execute(f"SELECT citing, cited FROM citations WHERE citing IN ({marks})", chunk):
+                refs[row["citing"]].append(row["cited"])
+        return refs
+
+    def aliases(self, openalex_ids: list[str] | None = None, topic_id: int | None = None) -> dict[str, int]:
+        """OpenAlex id -> paper id, for the given ids, or for every paper in a topic."""
+        if topic_id is not None:
+            return {r["openalex_id"]: r["paper_id"] for r in self.conn.execute(
+                """SELECT a.openalex_id, a.paper_id FROM openalex_aliases a
+                   JOIN topic_papers tp ON tp.paper_id = a.paper_id WHERE tp.topic_id = ?""", (topic_id,))}
+        found: dict[str, int] = {}
+        for chunk in _chunks(openalex_ids or [], 500):
+            marks = ",".join("?" * len(chunk))
+            for r in self.conn.execute(
+                f"SELECT openalex_id, paper_id FROM openalex_aliases WHERE openalex_id IN ({marks})", chunk
+            ):
+                found[r["openalex_id"]] = r["paper_id"]
+        return found
+
+    def topic_links(self, topic_id: int) -> dict[int, tuple[int, int]]:
+        """paper id -> (topic papers citing it, topic papers it cites), counting each
+        paper once however many OpenAlex versions it has."""
+        sql = """WITH t AS (SELECT a.openalex_id, a.paper_id FROM openalex_aliases a
+                           JOIN topic_papers tp ON tp.paper_id = a.paper_id WHERE tp.topic_id = ?)
+                 SELECT {group}.paper_id AS paper_id, COUNT(DISTINCT {other}.paper_id) AS n
+                 FROM citations c JOIN t cited ON cited.openalex_id = c.cited
+                                  JOIN t citing ON citing.openalex_id = c.citing
+                 WHERE cited.paper_id != citing.paper_id
+                 GROUP BY {group}.paper_id"""
+        cited_by = {r["paper_id"]: r["n"]
+                    for r in self.conn.execute(sql.format(group="cited", other="citing"), (topic_id,))}
+        cites = {r["paper_id"]: r["n"]
+                 for r in self.conn.execute(sql.format(group="citing", other="cited"), (topic_id,))}
+        return {pid: (cited_by.get(pid, 0), cites.get(pid, 0)) for pid in cited_by.keys() | cites.keys()}
 
     # -- files ------------------------------------------------------------------
 

@@ -19,3 +19,9 @@ def test_relevance_dominates():
 
 def test_scores_are_bounded():
     assert 0 <= score(["x"], "x", "x", 2026, 10**6, TODAY) <= 1
+
+
+def test_being_cited_by_the_topic_outweighs_citing_it():
+    foundational = score([], "x", None, 2020, 0, TODAY, cited_in=10, cites_out=0, max_links=10)
+    review = score([], "x", None, 2020, 0, TODAY, cited_in=0, cites_out=10, max_links=10)
+    assert foundational > review

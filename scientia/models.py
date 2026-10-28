@@ -83,6 +83,10 @@ class Paper:
     # OpenAlex holds a cached copy (downloadable through its metered content API).
     openalex_has_pdf: bool = False
     landing_url: str | None = None
+    work_type: str | None = None  # OpenAlex type: article, review, preprint, book-chapter...
+    is_retracted: bool | None = None
+    # OpenAlex ids of the works this one cites; None when the source doesn't say.
+    references: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.doi = normalize_doi(self.doi)

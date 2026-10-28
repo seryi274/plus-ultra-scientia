@@ -18,7 +18,9 @@ _FIELDS = ",".join([
     "id", "doi", "display_name", "ids", "publication_year", "publication_date",
     "authorships", "primary_location", "locations", "best_oa_location",
     "open_access", "cited_by_count", "abstract_inverted_index", "has_content",
+    "type", "is_retracted", "referenced_works",
 ])
+_BATCH = 100  # OpenAlex accepts up to 100 OR-ed values in one filter
 
 
 class OpenAlexError(RuntimeError):
@@ -31,6 +33,7 @@ class OpenAlex:
     def __init__(self, http: HttpClient, api_key: str | None = None):
         self._http = http
         self._api_key = api_key
+        self.cost_usd = 0.0  # running total, as reported by the API in meta.cost_usd
 
     def search(
         self,
@@ -41,7 +44,7 @@ class OpenAlex:
         sort: str | None = None,
     ) -> list[Paper]:
         """Search titles, abstracts and keywords. `sort` is an OpenAlex sort key such
-        as '-cited_by_count'; the default is relevance."""
+        as 'cited_by_count:desc'; the default is relevance."""
         filters = []
         if since:
             filters.append(f"from_publication_date:{since}")
@@ -67,12 +70,57 @@ class OpenAlex:
             response = self._http.get(API, params=params)
             if response.status_code != 200:
                 raise OpenAlexError(f"OpenAlex {response.status_code}: {response.text[:300]}")
-            results = response.json().get("results", [])
+            data = response.json()
+            self._charge(data)
+            results = data.get("results", [])
             papers.extend(parse_work(w) for w in results if w.get("display_name"))
             if len(results) < params["per_page"]:
                 break
             page += 1
         return papers[:limit]
+
+    def get_many(self, openalex_ids: list[str]) -> list[Paper]:
+        """Full records for many works, 100 per call ($0.0001 each)."""
+        papers = []
+        for i in range(0, len(openalex_ids), _BATCH):
+            papers += self._list(f"openalex:{'|'.join(openalex_ids[i:i + _BATCH])}")
+        return papers
+
+    def resolve(self, dois: list[str] = (), pmids: list[str] = ()) -> list[Paper]:
+        """OpenAlex records for papers known only by DOI or PMID, batched."""
+        papers = []
+        for column, values in (("doi", list(dois)), ("pmid", list(pmids))):
+            for i in range(0, len(values), 50):  # DOIs are long; keep URLs modest
+                papers += self._list(f"{column}:{'|'.join(values[i:i + 50])}")
+        return papers
+
+    def citing(self, openalex_id: str, limit: int = 100, since: str | None = None) -> list[Paper]:
+        """Works citing this one, most cited first. One call per 100 results: the
+        `cites` filter does not accept OR-ed ids."""
+        flt = f"cites:{openalex_id}" + (f",from_publication_date:{since}" if since else "")
+        papers: list[Paper] = []
+        page = 1
+        while len(papers) < limit:
+            batch = self._list(flt, sort="cited_by_count:desc", page=page)
+            papers += batch
+            if len(batch) < _BATCH:
+                break
+            page += 1
+        return papers[:limit]
+
+    def _list(self, flt: str, **extra: Any) -> list[Paper]:
+        params: dict[str, Any] = {"filter": flt, "per_page": _BATCH, "select": _FIELDS, **extra}
+        if self._api_key:
+            params["api_key"] = self._api_key
+        response = self._http.get(API, params=params)
+        if response.status_code != 200:
+            raise OpenAlexError(f"OpenAlex {response.status_code}: {response.text[:300]}")
+        data = response.json()
+        self._charge(data)
+        return [parse_work(w) for w in data.get("results", []) if w.get("display_name")]
+
+    def _charge(self, data: dict[str, Any]) -> None:
+        self.cost_usd += float((data.get("meta") or {}).get("cost_usd") or 0)
 
     def get_by_doi(self, doi: str) -> Paper | None:
         """Single-record lookup (free of charge)."""
@@ -129,6 +177,12 @@ def parse_work(work: dict[str, Any]) -> Paper:
         pdf_urls=pdf_urls,
         openalex_has_pdf=bool((work.get("has_content") or {}).get("pdf")),
         landing_url=work.get("doi") or primary.get("landing_page_url"),
+        work_type=work.get("type"),
+        is_retracted=work.get("is_retracted"),
+        references=(
+            [r for r in map(_last_path_segment, work["referenced_works"]) if r]
+            if "referenced_works" in work else None
+        ),
     )
 
 
