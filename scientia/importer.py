@@ -107,7 +107,7 @@ class Importer:
             return ImportResult(path, "not-pdf", "file does not start with a PDF header")
         sha = hashlib.sha256(data).hexdigest()
         if (existing := self._store.file_with_hash(sha)) and not force:
-            return ImportResult(path, "duplicate", f"identical file already filed at {existing['path']}",
+            return ImportResult(path, "duplicate", f"identical file already filed at {self._store.resolve(existing['path'])}",
                                 existing["paper_id"])
 
         try:

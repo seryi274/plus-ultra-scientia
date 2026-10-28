@@ -62,14 +62,14 @@ class Acquirer:
         existing = self._store.files(paper.id)
 
         if "xml" in existing:
-            outcome.xml = Path(existing["xml"]["path"])
+            outcome.xml = self._store.resolve(existing["xml"]["path"])
         elif paper.pmcid and paper.is_oa:
             url = EuropePMC.fulltext_xml_url(paper.pmcid)
             if data := self._download(url, outcome, "europepmc-xml", expect=b"<"):
                 outcome.xml = self._save(paper, folder / "paper.xml", data, "xml", url, "europepmc")
 
         if "pdf" in existing:
-            outcome.pdf = Path(existing["pdf"]["path"])
+            outcome.pdf = self._store.resolve(existing["pdf"]["path"])
         else:
             for url, via, license in self._pdf_candidates(paper, outcome):
                 if data := self._download(url, outcome, via, expect=b"%PDF"):

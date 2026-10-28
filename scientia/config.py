@@ -1,6 +1,8 @@
 """Runtime configuration, read from environment variables.
 
-SCIENTIA_HOME      Library root (database + downloaded files). Default: ./library
+SCIENTIA_HOME      Library root (database + downloaded files). Default: ~/scientia-library,
+                   a fixed per-user folder, so every command finds the same library no
+                   matter which directory it is run from.
 OPENALEX_API_KEY   Free key from https://openalex.org/settings/api-key. Without it,
                    every caller on your IP shares a $0.10/day budget.
 SCIENTIA_EMAIL     Contact address sent to APIs that ask for one (Unpaywall requires
@@ -14,6 +16,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+
+DEFAULT_HOME = Path.home() / "scientia-library"
 
 
 @dataclass(frozen=True)
@@ -44,7 +49,7 @@ class Config:
     @classmethod
     def from_env(cls) -> Config:
         return cls(
-            home=Path(os.environ.get("SCIENTIA_HOME", "library")).resolve(),
+            home=Path(os.environ.get("SCIENTIA_HOME") or DEFAULT_HOME).expanduser().resolve(),
             openalex_api_key=os.environ.get("OPENALEX_API_KEY") or None,
             email=os.environ.get("SCIENTIA_EMAIL") or None,
             core_api_key=os.environ.get("CORE_API_KEY") or None,

@@ -59,7 +59,9 @@ def test_doi_match_files_pdf_and_marks_downloaded(env, tmp_path):
     pdf = make_pdf(tmp_path / "download.pdf", "doi:10.1000/ABC")
     result = importer.import_pdf(pdf)
     assert (result.status, result.paper_id) == ("imported", pid)
-    filed = Path(store.files(pid)["pdf"]["path"])
+    stored = store.files(pid)["pdf"]["path"]
+    assert stored.startswith("papers/")  # relative to the library root
+    filed = store.resolve(stored)
     assert filed.read_bytes() == pdf.read_bytes() and pdf.exists()  # copied, not moved
     assert (filed.parent / "metadata.json").exists()
     assert store.topic_papers(topic)[0].status == "downloaded"

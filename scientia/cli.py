@@ -7,6 +7,7 @@
     scientia report <topic>
     scientia mark   <topic> <paper> read|skipped|new
     scientia topics
+    scientia info
 """
 
 from __future__ import annotations
@@ -109,6 +110,9 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("topics", help="list topics")
     p.set_defaults(handler=cmd_topics)
+
+    p = sub.add_parser("info", help="show the library location and which API keys are set")
+    p.set_defaults(handler=cmd_info)
     return parser
 
 
@@ -243,7 +247,7 @@ def cmd_report(args, config: Config, store: Store, http: HttpClient) -> int:
         links = []
         if with_file:
             for kind, row in store.files(p.id).items():
-                rel = _relative(row["path"], out_dir)
+                rel = _relative(store.resolve(row["path"]), out_dir)
                 links.append(f"[{kind.upper()}]({rel})")
         if p.landing_url:
             links.append(f"[source]({p.landing_url})")
@@ -285,7 +289,21 @@ def cmd_mark(args, config: Config, store: Store, http: HttpClient) -> int:
     return 0
 
 
+def cmd_info(args, config: Config, store: Store, http: HttpClient) -> int:
+    source = "SCIENTIA_HOME" if os.environ.get("SCIENTIA_HOME") else "default; set SCIENTIA_HOME to change"
+    papers = store.conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    files = store.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    print(f"Library:  {config.home}  ({source})")
+    print(f"Inbox:    {config.inbox_dir}")
+    print(f"Contents: {len(store.topics())} topics, {papers} papers, {files} files")
+    for name, value in (("OPENALEX_API_KEY", config.openalex_api_key), ("SCIENTIA_EMAIL", config.email),
+                        ("S2_API_KEY", config.s2_api_key), ("CORE_API_KEY", config.core_api_key)):
+        print(f"{name + ':':<18}{'set' if value else 'not set'}")
+    return 0
+
+
 def cmd_topics(args, config: Config, store: Store, http: HttpClient) -> int:
+    print(f"Library: {config.home}\n")
     rows = store.topics()
     if not rows:
         print("No topics yet. Start one with: scientia search <topic> \"<query>\"")

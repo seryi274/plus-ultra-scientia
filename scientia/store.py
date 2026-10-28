@@ -1,6 +1,9 @@
 """SQLite persistence. The database, not the agent, is the source of truth: every paper
 is stored once (deduplicated across sources by DOI / arXiv id / PMID / PMCID / OpenAlex id,
-falling back to title + year), and each topic keeps its own scores and reading status."""
+falling back to title + year), and each topic keeps its own scores and reading status.
+
+File paths are stored relative to the library root (the database's folder), so the whole
+library can be moved or synced to another machine without breaking them."""
 
 from __future__ import annotations
 
@@ -115,10 +118,12 @@ class StoredPaper:
 class Store:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.home = path.parent.resolve()
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(_SCHEMA)
+        self._relativize_file_paths()
 
     def close(self) -> None:
         self.conn.close()
@@ -339,6 +344,37 @@ class Store:
 
     # -- files ------------------------------------------------------------------
 
+    def resolve(self, stored_path: str) -> Path:
+        """Absolute location of a path from the files table."""
+        path = Path(stored_path)
+        return path if path.is_absolute() else self.home / path
+
+    def _to_stored(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(self.home).as_posix()
+        except ValueError:
+            return str(path)  # outside the library: keep it absolute
+
+    def _relativize_file_paths(self) -> None:
+        """Rewrite absolute paths left by older versions, including ones pointing at the
+        library's previous location (re-rooted at their 'papers' folder)."""
+        changed = False
+        for row in self.conn.execute("SELECT id, path FROM files").fetchall():
+            path = Path(row["path"])
+            if not path.is_absolute():
+                continue
+            stored = self._to_stored(path)
+            if Path(stored).is_absolute() and "papers" in path.parts:
+                i = len(path.parts) - 1 - path.parts[::-1].index("papers")
+                candidate = Path(*path.parts[i:])
+                if (self.home / candidate).exists():
+                    stored = candidate.as_posix()
+            if stored != row["path"]:
+                self.conn.execute("UPDATE files SET path = ? WHERE id = ?", (stored, row["id"]))
+                changed = True
+        if changed:
+            self.conn.commit()
+
     def add_file(self, paper_id: int, kind: str, path: Path, url: str, via: str,
                  license: str | None, sha256: str) -> None:
         self.conn.execute(
@@ -347,7 +383,7 @@ class Store:
                ON CONFLICT (paper_id, kind) DO UPDATE SET path = excluded.path, url = excluded.url,
                    via = excluded.via, license = excluded.license, sha256 = excluded.sha256,
                    retrieved_at = excluded.retrieved_at""",
-            (paper_id, kind, str(path), url, via, license, sha256, _now()),
+            (paper_id, kind, self._to_stored(path), url, via, license, sha256, _now()),
         )
 
     def file_with_hash(self, sha256: str) -> sqlite3.Row | None:

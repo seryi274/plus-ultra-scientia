@@ -23,7 +23,7 @@ Environment variables (all optional):
 | `SCIENTIA_EMAIL` | Contact address sent in the User-Agent, and required to enable the Unpaywall fallback. |
 | `S2_API_KEY` | Semantic Scholar key (free). Without it, the shared public pool is often throttled. |
 | `CORE_API_KEY` | CORE key (free, <https://core.ac.uk/services/api>). Raises the rate limit and enables CORE's own download endpoint. |
-| `SCIENTIA_HOME` | Library location (default `./library`, which is git-ignored). |
+| `SCIENTIA_HOME` | Library location. Default: `~/scientia-library` (`C:\Users\<you>\scientia-library` on Windows), the same whichever folder you run from. |
 
 ## Usage
 
@@ -36,21 +36,27 @@ scientia search neural-operators --sort recent
 
 scientia list neural-operators --top 20
 scientia fetch neural-operators --top 10 -v   # download open-access PDFs / XML
-scientia report neural-operators              # library/topics/neural-operators/reading-list.md
-scientia import --move                        # file PDFs you saved into library/inbox/
+scientia report neural-operators              # <library>/topics/neural-operators/reading-list.md
+scientia import --move                        # file PDFs you saved into <library>/inbox/
 scientia mark neural-operators 12 read --note "key idea: spectral convolution"
 scientia topics
+scientia info                                 # where the library is, which keys are set
 ```
 
 Library layout:
 
 ```
-library/
+scientia-library/
   research.db                         papers, topics, searches, per-topic status, files
   inbox/                              drop manually downloaded PDFs here
   papers/<doi_|arxiv_|...id>/         paper.pdf, paper.xml (Europe PMC JATS), metadata.json
   topics/<topic>/reading-list.md
 ```
+
+File paths in the database are relative to the library root. You can move the whole folder,
+or sync it to another machine, and point `SCIENTIA_HOME` at the new location. Libraries
+written with absolute paths by older versions are converted automatically on open.
+The library is kept outside the repository, so licensed PDFs can't be committed by accident.
 
 ## Where full text comes from
 
@@ -74,7 +80,7 @@ DOI link so you can retrieve them by hand through the UNED library.
 ### Importing PDFs you downloaded yourself
 
 1. Open the DOI links from the reading list's *Needs manual retrieval* section while signed in to the UNED library.
-2. Save each PDF into `library/inbox/`. Any file name works.
+2. Save each PDF into the library's `inbox/` folder (`scientia info` shows where it is). Any file name works.
 3. Run `scientia import --move`.
 
 Each file is matched to its paper by the DOI in the PDF's metadata or file name, then by a

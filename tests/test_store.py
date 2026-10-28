@@ -62,3 +62,25 @@ def test_topic_status_and_lookup(store):
     assert p.status == "read" and p.note == "skimmed"
     with pytest.raises(ValueError):
         store.set_status(t, pid, "bogus")
+
+
+def test_absolute_paths_from_a_moved_library_are_repaired(tmp_path):
+    old, new = tmp_path / "old-lib", tmp_path / "new-lib"
+    s = Store(old / "research.db")
+    pid, _ = s.add_paper(Paper(title="Gamma", source="arxiv", arxiv_id="2001.00003"))
+    (old / "papers" / "arxiv_2001.00003").mkdir(parents=True)
+    (old / "papers" / "arxiv_2001.00003" / "paper.pdf").write_bytes(b"%PDF-1.4")
+    # Simulate a row written by an older version, which stored absolute paths.
+    s.conn.execute(
+        "INSERT INTO files (paper_id, kind, path, url, via, sha256, retrieved_at) VALUES (?, 'pdf', ?, 'u', 'arxiv', 'h', 't')",
+        (pid, str(old / "papers" / "arxiv_2001.00003" / "paper.pdf")),
+    )
+    s.commit()
+    s.close()
+    old.rename(new)
+
+    s = Store(new / "research.db")
+    stored = s.files(pid)["pdf"]["path"]
+    assert stored == "papers/arxiv_2001.00003/paper.pdf"
+    assert s.resolve(stored).read_bytes() == b"%PDF-1.4"
+    s.close()
