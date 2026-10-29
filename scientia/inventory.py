@@ -112,3 +112,19 @@ def write_inventory(store: Store, topic_names: list[str], path: Path) -> dict[tu
         writer.writeheader()
         writer.writerows(rows)
     return dict(counts)
+
+
+def format_counts(counts: dict[tuple[str, str], int]) -> str:
+    """The summary table printed after writing an inventory: access category by relevance."""
+    groups = ("central/relevant", "tangential/off-topic", "not triaged")
+    accesses = [a for a in ACCESS_ORDER if any(counts.get((g, a)) for g in groups)]
+    width = max((len(a) for a in accesses), default=10)
+    lines = [f"{'':<{width}}  {'central/relevant':>16}  {'other':>6}  {'total':>6}"]
+    for a in accesses:
+        cr = counts.get((groups[0], a), 0)
+        other = counts.get((groups[1], a), 0) + counts.get((groups[2], a), 0)
+        lines.append(f"{a:<{width}}  {cr:>16}  {other:>6}  {cr + other:>6}")
+    total_cr = sum(n for (g, _), n in counts.items() if g == groups[0])
+    total = sum(counts.values())
+    lines.append(f"{'total':<{width}}  {total_cr:>16}  {total - total_cr:>6}  {total:>6}")
+    return "\n".join(lines)

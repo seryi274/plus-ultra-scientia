@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -41,6 +42,27 @@ from scientia.store import Store, StoredPaper
 
 _MAX_BYTES = 100 * 1024 * 1024
 _UNPAYWALL = "https://api.unpaywall.org/v2"
+_BREAKER_LIMIT = 12  # consecutive service failures before a route is switched off for the run
+
+
+class _Breaker:
+    """Switches off a lookup route (CORE, Semantic Scholar, Unpaywall, Europe PMC XML) for the
+    rest of a run once it fails many times in a row, so an outage costs seconds, not hours."""
+
+    def __init__(self, limit: int = _BREAKER_LIMIT):
+        self._limit = limit
+        self._failures: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self.disabled: list[str] = []
+
+    def is_open(self, route: str) -> bool:
+        return route in self.disabled
+
+    def record(self, route: str, failed: bool) -> None:
+        with self._lock:
+            self._failures[route] = self._failures.get(route, 0) + 1 if failed else 0
+            if failed and self._failures[route] >= self._limit and route not in self.disabled:
+                self.disabled.append(route)
 
 
 @dataclass
@@ -93,6 +115,17 @@ class Acquirer:
         self._core = Core(http, config.core_api_key)
         self._allow_paid = allow_paid
         self._s2_known: dict[int, tuple[str, str | None] | None] = {}  # filled by prefetch()
+        self._breaker = _Breaker()
+
+    @property
+    def disabled_routes(self) -> list[str]:
+        return list(self._breaker.disabled)
+
+    def _skip(self, route: str, outcome: Outcome) -> bool:
+        if self._breaker.is_open(route):
+            outcome.tries.append(Attempt(route, None, "skipped_disabled", "switched off after repeated failures"))
+            return True
+        return False
 
     def prefetch(self, papers: list[StoredPaper]) -> int:
         """Look up Semantic Scholar's open-access links for many papers at once (500 per
@@ -132,9 +165,12 @@ class Acquirer:
 
         if "xml" in existing:
             outcome.xml = existing["xml"]
-        elif paper.pmcid and paper.is_oa:
+        elif paper.pmcid and paper.is_oa and not self._skip("europepmc-xml", outcome):
             url = EuropePMC.fulltext_xml_url(paper.pmcid)
-            if data := self._download(url, outcome, "europepmc-xml", expect=b"<"):
+            data = self._download(url, outcome, "europepmc-xml", expect=b"<")
+            last = outcome.tries[-1].result
+            self._breaker.record("europepmc-xml", last.startswith("http_5") or last == "network_error")
+            if data:
                 outcome.xml = self._save(outcome, folder / "paper.xml", data, "xml", url, "europepmc")
 
         if "pdf" in existing:
@@ -157,7 +193,7 @@ class Acquirer:
             if url not in tried and "arxiv.org/" not in url:
                 tried.add(url)
                 yield url, "oa-link", paper.license
-        if paper.doi and self._config.unpaywall_email:
+        if paper.doi and self._config.unpaywall_email and not self._skip("unpaywall", outcome):
             for url, license in self._unpaywall(paper.doi, outcome):
                 if url not in tried:
                     tried.add(url)
@@ -177,25 +213,33 @@ class Acquirer:
     def _lookup_routes(self, paper: StoredPaper, outcome: Outcome):
         """Semantic Scholar, then CORE. Each is one or two API calls, so they run only
         when the free direct routes have failed."""
-        try:
-            if paper.id in self._s2_known:
-                found = self._s2_known[paper.id]
-            else:
+        found = None
+        if paper.id in self._s2_known:
+            found = self._s2_known[paper.id]
+        elif not self._skip("semanticscholar", outcome):
+            try:
                 found = self._s2.open_pdf(doi=paper.doi, pmid=paper.pmid, title=paper.title)
-            if found:
-                yield found[0], "semanticscholar", found[1]
-            else:
-                outcome.tries.append(Attempt("semanticscholar", None, "no_link"))
-        except Exception as exc:
-            outcome.tries.append(Attempt("semanticscholar", None, "lookup_failed", str(exc)))
+                self._breaker.record("semanticscholar", failed=False)
+            except Exception as exc:
+                outcome.tries.append(Attempt("semanticscholar", None, "lookup_failed", str(exc)))
+                self._breaker.record("semanticscholar", failed=True)
+        if found:
+            yield found[0], "semanticscholar", found[1]
+        elif not outcome.tries or outcome.tries[-1].via != "semanticscholar":
+            outcome.tries.append(Attempt("semanticscholar", None, "no_link"))
+        if self._skip("core", outcome):
+            return
         try:
             urls = self._core.open_pdfs(doi=paper.doi, title=paper.title)
-            if not urls:
-                outcome.tries.append(Attempt("core", None, "no_link"))
-            for url in urls:
-                yield url, "core", None
+            self._breaker.record("core", failed=False)
         except Exception as exc:
             outcome.tries.append(Attempt("core", None, "lookup_failed", str(exc)))
+            self._breaker.record("core", failed=True)
+            return
+        if not urls:
+            outcome.tries.append(Attempt("core", None, "no_link"))
+        for url in urls:
+            yield url, "core", None
 
     def _unpaywall(self, doi: str, outcome: Outcome) -> list[tuple[str, str | None]]:
         try:
@@ -203,7 +247,10 @@ class Acquirer:
                                       retries=1)
         except Exception as exc:
             outcome.tries.append(Attempt("unpaywall", None, "lookup_failed", type(exc).__name__))
+            self._breaker.record("unpaywall", failed=True)
             return []
+        # 404 means Unpaywall doesn't know the DOI: an answer, not a service failure.
+        self._breaker.record("unpaywall", failed=response.status_code >= 500)
         if response.status_code != 200:
             outcome.tries.append(Attempt("unpaywall", None, "lookup_failed", f"HTTP {response.status_code}"))
             return []

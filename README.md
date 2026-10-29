@@ -27,6 +27,41 @@ Environment variables (all optional):
 | `ANTHROPIC_API_KEY` | Claude API key from <https://platform.claude.com> (billed separately from a Claude subscription). Needed only for `scientia review`. |
 | `SCIENTIA_HOME` | Library location. Default: `~/scientia-library` (`C:\Users\<you>\scientia-library` on Windows), the same whichever folder you run from. |
 
+## Research projects
+
+This repository is the infrastructure. Each piece of research lives in its own folder, kept
+outside this repository and versionable on its own. A `project.toml` in that folder declares:
+
+- the topics;
+- their labelled queries, with `${VARIABLES}` for parts repeated across queries;
+- the research question each topic's papers are judged against;
+- the review profile (or a custom JSON schema), plus project-specific guidance for the LLM prompts;
+- the citation-expansion steps.
+
+```powershell
+scientia run ..\axspa-research --dry-run       # apply project.toml, show what would run + cost
+scientia run ..\axspa-research                 # search, expand, triage, fetch, reports, inventory
+scientia run ..\axspa-research --with-extract  # also Opus evidence extraction (opt-in: costly)
+scientia run ..\axspa-research --topic axspa-treatment --steps search,triage
+```
+
+`run` is idempotent:
+- a query already searched on a source is skipped, and so is an expansion step already run
+  with the same settings;
+- reviewed papers aren't sent again, and downloads only try papers not yet attempted;
+- `--refresh` re-runs searches and expansions (to pick up new publications) and retries
+  failed downloads.
+
+LLM spend per run is capped by `max_review_cost`. If the estimate exceeds the cap, the
+top-ranked papers that fit are reviewed and the rest wait for the next run.
+
+Outputs go to `<project>/outputs/`: `inventory.csv`, plus `<topic>/reading-list.md` and
+`<topic>/evidence.md`. All papers, PDFs and the database stay in the shared library, so a
+paper found by two projects is stored once. The format is documented at the top of
+`scientia/project.py`.
+
+The individual commands below remain available for exploring a topic by hand.
+
 ## Usage
 
 ```powershell
@@ -234,11 +269,19 @@ pathways, key findings, public datasets and stated therapeutic implications.
 Costs on the AS pilot (about 700 papers per topic): triage about $0.13 per topic, and
 extraction about $0.013 per paper at batch price.
 
+## Robustness
+
+If a lookup service fails 12 times in a row during a fetch (CORE, Semantic Scholar,
+Unpaywall, Europe PMC XML), it is switched off for the rest of the run. Its attempts are
+then recorded as `skipped_disabled`, so an outage costs seconds instead of hours.
+Optional lookups are retried once, not with the full backoff.
+
 ## Next steps
 
+- `scientia update`: re-search with recent-first sorting, triage only what is new, and write a "what's new since last time" digest; schedule it weekly.
 - A bridge report across topics: shared key terms, and genetics findings that bear on treatment questions.
-- Full-text extraction for the shortlist (Europe PMC JATS first), once UNED confirms what may be processed.
-- Scheduled monitoring (weekly `search --sort recent` plus a digest).
+- A full-text layer (Europe PMC JATS and PDF to sectioned text) with a licence policy deciding what may be sent to an LLM.
+- Export to Zotero (BibTeX/RIS with PDFs); CI running the tests on every push.
 - Publisher TDM clients, once UNED confirms entitlement.
 
 ## Tests

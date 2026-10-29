@@ -157,7 +157,8 @@ CREATE TABLE IF NOT EXISTS review_batches (
 _ADDED_COLUMNS = {
     "papers": [("work_type", "TEXT"), ("is_retracted", "INTEGER"),
                ("abstract_source", "TEXT"), ("abstract_checked", "TEXT"), ("oa_status", "TEXT")],
-    "topics": [("review_question", "TEXT"), ("review_profile", "TEXT")],
+    "topics": [("review_question", "TEXT"), ("review_profile", "TEXT"),
+               ("review_schema", "TEXT"), ("review_hints", "TEXT")],
 }
 
 
@@ -517,18 +518,35 @@ class Store:
 
     # -- reviews ------------------------------------------------------------------
 
-    def review_settings(self, topic_id: int) -> tuple[str | None, str | None]:
+    def review_settings(self, topic_id: int) -> dict[str, Any]:
+        """question, profile, schema (a JSON schema for custom profiles, else None) and
+        hints ({"triage": ..., "extract": ...} project guidance appended to the prompts)."""
         row = self.conn.execute(
-            "SELECT review_question, review_profile FROM topics WHERE id = ?", (topic_id,)
+            "SELECT review_question, review_profile, review_schema, review_hints FROM topics WHERE id = ?",
+            (topic_id,),
         ).fetchone()
-        return row["review_question"], row["review_profile"]
+        return {
+            "question": row["review_question"],
+            "profile": row["review_profile"],
+            "schema": json.loads(row["review_schema"]) if row["review_schema"] else None,
+            "hints": json.loads(row["review_hints"]) if row["review_hints"] else {},
+        }
 
-    def set_review_settings(self, topic_id: int, question: str | None, profile: str | None) -> None:
-        self.conn.execute(
-            """UPDATE topics SET review_question = COALESCE(?, review_question),
-                                 review_profile = COALESCE(?, review_profile) WHERE id = ?""",
-            (question, profile, topic_id),
-        )
+    def set_review_settings(self, topic_id: int, question: str | None = None, profile: str | None = None,
+                            schema: dict | None = None, hints: dict | None = None) -> None:
+        """Set the given fields, leaving the others unchanged. A built-in profile name
+        clears any custom schema."""
+        updates: dict[str, Any] = {}
+        if question:
+            updates["review_question"] = question
+        if profile:
+            updates["review_profile"] = profile
+            updates["review_schema"] = json.dumps(schema) if schema else None
+        if hints is not None:
+            updates["review_hints"] = json.dumps(hints)
+        if updates:
+            assignments = ", ".join(f"{c} = ?" for c in updates)
+            self.conn.execute(f"UPDATE topics SET {assignments} WHERE id = ?", (*updates.values(), topic_id))
 
     def save_review(self, topic_id: int, paper_id: int, stage: str, status: str, model: str, *,
                     batch_id: str | None = None, result: str | None = None, input_tokens: int = 0,

@@ -82,10 +82,11 @@ PROFILES: dict[str, tuple[dict, str]] = {
         _obj(
             population=_str("condition, subgroup and key characteristics"),
             sample_size=_str(),
-            interventions=_list(_obj(name=_str(), drug_class=_str("standard class name, e.g. 'TNF inhibitor'"),
+            interventions=_list(_obj(name=_str(), drug_class=_str("standard class name, e.g. 'beta blocker'"),
                                      regimen=_str())),
             comparator=_str(),
-            outcomes=_list(_obj(measure=_str("e.g. ASAS40, BASDAI, mSASSS"), timepoint=_str(), result=_str())),
+            outcomes=_list(_obj(measure=_str("the named outcome measure or score"), timepoint=_str(),
+                                result=_str())),
             response_predictors=_list(_obj(
                 factor=_str(),
                 association=_enum(("better_response", "worse_response", "no_association", "unclear")),
@@ -96,14 +97,13 @@ PROFILES: dict[str, tuple[dict, str]] = {
             limitations=_list(_str()),
             open_questions=_list(_str()),
         ),
-        "- interventions: every treatment studied, with its drug class in standard terms "
-        "(e.g. 'TNF inhibitor', 'IL-17 inhibitor', 'JAK inhibitor', 'IL-23 inhibitor', 'NSAID').\n"
+        "- interventions: every treatment studied, with its drug class in standard terms.\n"
         "- response_predictors: only factors the abstract reports as associated (or explicitly not "
-        "associated) with treatment response, e.g. CRP, HLA-B27, MRI inflammation, sex, smoking, BMI.",
+        "associated) with treatment response.",
     ),
     "genetics": (
         _obj(
-            genes_variants=_list(_str(), "genes, loci and variants as written, e.g. 'ERAP1 rs30187'"),
+            genes_variants=_list(_str(), "gene symbols, loci and variant ids as written"),
             pathways=_list(_str()),
             cell_types=_list(_str()),
             data_types=_list(_enum(DATA_TYPES)),
@@ -138,10 +138,10 @@ For each paper you get its title, metadata and abstract. Judge:
   tangential: same disease or field, but about something else
   off_topic: unrelated
 - study_design: what the paper reports doing, as described
-- key_terms: the specific drugs, genes, variants, pathways, cell types, biomarkers or datasets the paper is about, written as they appear (e.g. "secukinumab", "ERAP1", "IL-23/IL-17 axis"), at most 10
+- key_terms: the specific drugs, genes, variants, pathways, cell types, biomarkers, methods or datasets the paper is about, written as they appear, at most 10
 - reason: one sentence explaining the relevance rating
 
-Use only the information given. When there is no abstract, judge from the title, keep the rating conservative and say so in the reason."""
+Use only the information given. When there is no abstract, judge from the title, keep the rating conservative and say so in the reason.{hints}"""
 
 _EXTRACT_SYSTEM = """You extract structured evidence from scientific abstracts for a literature review.
 
@@ -154,7 +154,7 @@ Rules:
 - Copy numbers exactly as written, with units, confidence intervals and p-values.
 - Keep each entry short: a phrase or one sentence.
 - limitations and open_questions: only those the abstract states or explicitly leaves unresolved, not your own suggestions.
-{guide}"""
+{guide}{hints}"""
 
 
 # -- reviewer -----------------------------------------------------------------------
@@ -168,13 +168,19 @@ class CollectResult:
 
 class Reviewer:
     def __init__(self, store: Store, topic_id: int, question: str, profile: str,
-                 client: anthropic.Anthropic | None = None):
-        if profile not in PROFILES:
-            raise ValueError(f"profile must be one of {', '.join(PROFILES)}")
+                 client: anthropic.Anthropic | None = None, schema: dict | None = None,
+                 hints: dict[str, str] | None = None):
+        """`profile` is a built-in name, or any name together with a custom JSON `schema`.
+        `hints` holds project-specific guidance for the 'triage' and 'extract' prompts."""
+        if profile not in PROFILES and schema is None:
+            raise ValueError(f"profile must be one of {', '.join(PROFILES)} or come with a schema")
         self.store = store
         self.topic_id = topic_id
         self.question = question
         self.profile = profile
+        self.schema = schema or PROFILES[profile][0]
+        self.guide = PROFILES[profile][1] if profile in PROFILES else ""
+        self.hints = hints or {}
         self._client = client
 
     @property
@@ -213,12 +219,14 @@ class Reviewer:
     # -- requests ------------------------------------------------------------------
 
     def _system(self, stage: str) -> str:
+        hint = self.hints.get(stage, "").strip()
+        hints = f"\n\nGuidance for this project:\n{hint}" if hint else ""
         if stage == "triage":
-            return _TRIAGE_SYSTEM.format(question=self.question)
-        return _EXTRACT_SYSTEM.format(question=self.question, guide=PROFILES[self.profile][1])
+            return _TRIAGE_SYSTEM.format(question=self.question, hints=hints)
+        return _EXTRACT_SYSTEM.format(question=self.question, guide=self.guide, hints=hints)
 
     def request_params(self, stage: str, paper: StoredPaper) -> dict[str, Any]:
-        schema = TRIAGE_SCHEMA if stage == "triage" else PROFILES[self.profile][0]
+        schema = TRIAGE_SCHEMA if stage == "triage" else self.schema
         return {
             "model": self.model(stage),
             "max_tokens": 4096 if stage == "triage" else 16000,  # thinking counts toward max_tokens

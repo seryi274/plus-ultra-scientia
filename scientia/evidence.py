@@ -116,7 +116,7 @@ def _genetics_sections(extracts: dict, triage: dict, ref) -> list[str]:
 def _general_sections(extracts: dict, ref) -> list[str]:
     rows = ["## Main findings", "| Paper | Methods | Main finding |", "|---|---|---|"]
     for pid, e in extracts.items():
-        rows.append("| " + " | ".join(_cell(x) for x in (ref(pid), e["methods"], e["main_finding"])) + " |")
+        rows.append("| " + " | ".join(_cell(x) for x in (ref(pid), e.get("methods", ""), e.get("main_finding", ""))) + " |")
     return ["\n".join(rows)]
 
 

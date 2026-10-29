@@ -1,9 +1,11 @@
 """Command-line interface.
 
+    scientia run <project folder> [--steps ...] [--topic <name>] [--with-extract] [--wait] [--dry-run]
+
     scientia search <topic> "<query>" [--label il17] [--since 2023-01-01] [--limit 50]
     scientia search <topic>                  (re-run all of the topic's saved queries)
     scientia queries <topic> [--remove <label>]
-    scientia list   <topic> [--top 20] [--status new]
+    scientia list   <topic> [--top 20] [--status new] [--sort foundational|frontier|recent]
     scientia expand <topic> [--seeds 25] [--direction both] [--min-links 2]
     scientia fetch  <topic> [--top 10] [--min-score 0.5] [--allow-paid]
     scientia import [pdfs or folders] [--topic <topic>] [--move]
@@ -23,34 +25,22 @@ import argparse
 import os
 import re
 import sys
-import textwrap
 from datetime import date
 from pathlib import Path
 
-from scientia import ranking
-from scientia.abstracts import backfill_abstracts
-from scientia.acquire import Acquirer
 from scientia.config import Config
 from scientia.evidence import write_evidence
-from scientia.expand import expand
 from scientia.importer import Importer, pdf_files
-from scientia.inventory import ACCESS_ORDER, write_inventory
+from scientia.inventory import format_counts, write_inventory
 from scientia.net import HttpClient
-from scientia.review import PROFILES, Reviewer, triage_results
-from scientia.sources.arxiv import Arxiv
-from scientia.sources.europepmc import EuropePMC
+from scientia.pipeline import (
+    SKIPPED_TYPES, SOURCES, clip, expand_params, refresh_oa_status, rescore, run_expand, run_fetch,
+    run_review, run_search, search_clients, view, write_reading_list,
+)
+from scientia.project import DEFAULT_STEPS, STEPS, ProjectError, load_project, run_project
+from scientia.review import PROFILES, triage_results
 from scientia.sources.openalex import OpenAlex
 from scientia.store import Store, StoredPaper
-
-SOURCES = ("openalex", "arxiv", "europepmc")
-# OpenAlex work types that citation expansion never adds.
-SKIPPED_TYPES = ("editorial", "letter", "erratum", "paratext", "retraction", "peer-review")
-# Per-source spelling of the --sort choices; None means the source's relevance order.
-_SORT = {
-    "openalex": {"recent": "publication_date:desc", "cited": "cited_by_count:desc"},
-    "arxiv": {"recent": "recent"},
-    "europepmc": {"recent": "recent", "cited": "cited"},
-}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -62,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with HttpClient(email=config.email) as http:
             return args.handler(args, config, store, http) or 0
-    except KeyError as exc:
+    except (KeyError, ProjectError) as exc:
         print(f"error: {exc.args[0]}", file=sys.stderr)
         return 2
     finally:
@@ -73,6 +63,19 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="scientia", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(required=True, metavar="command")
+
+    p = sub.add_parser("run", help="bring a research project (folder with project.toml) up to date")
+    p.add_argument("project", type=Path, help="project folder, or its project.toml")
+    p.add_argument("--steps", default=",".join(DEFAULT_STEPS),
+                   help=f"comma-separated subset of {','.join(STEPS)} (default: all but extract)")
+    p.add_argument("--with-extract", action="store_true", help="also run Opus evidence extraction (costly)")
+    p.add_argument("--topic", action="append", help="only this topic (repeatable)")
+    p.add_argument("--refresh", action="store_true",
+                   help="re-run searches and expansions that already ran, and retry failed downloads")
+    p.add_argument("--wait", action="store_true", help="wait for LLM review batches to finish")
+    p.add_argument("--dry-run", action="store_true",
+                   help="apply the project file, then only show what would run and what it would cost")
+    p.set_defaults(handler=cmd_run)
 
     p = sub.add_parser("search", help="discover papers for a topic and add them to the library")
     p.add_argument("topic", help="short topic name, e.g. neural-operators")
@@ -148,6 +151,7 @@ def _parser() -> argparse.ArgumentParser:
                         "extract = evidence from central/relevant papers (Opus)")
     p.add_argument("--include-tangential", action="store_true", help="extract: also papers rated tangential")
     p.add_argument("--limit", type=int, help="review at most this many papers")
+    p.add_argument("--max-cost", type=float, help="cap the estimated cost (USD); reviews the top papers that fit")
     p.add_argument("--sync", action="store_true",
                    help="send requests one at a time instead of a batch (full price; for small runs)")
     p.add_argument("--wait", action="store_true", help="wait for submitted batches to finish and collect them")
@@ -187,6 +191,19 @@ def _parser() -> argparse.ArgumentParser:
 
 # -- commands -------------------------------------------------------------------
 
+def cmd_run(args, config: Config, store: Store, http: HttpClient) -> int:
+    steps = tuple(s.strip() for s in args.steps.split(",") if s.strip())
+    if unknown := set(steps) - set(STEPS):
+        print(f"error: unknown step(s): {', '.join(sorted(unknown))}", file=sys.stderr)
+        return 2
+    if args.with_extract and "extract" not in steps:
+        steps += ("extract",)
+    project = load_project(args.project)
+    print(f"Project: {project.name} ({project.root})" + (f" - {project.description}" if project.description else ""))
+    return run_project(project, store, http, config, steps=tuple(s for s in STEPS if s in steps),
+                       only=args.topic, refresh=args.refresh, wait=args.wait, dry_run=args.dry_run)
+
+
 def cmd_search(args, config: Config, store: Store, http: HttpClient) -> int:
     if args.query:
         topic_id = store.upsert_topic(args.topic)
@@ -201,11 +218,6 @@ def cmd_search(args, config: Config, store: Store, http: HttpClient) -> int:
             print(f"error: topic '{args.topic}' has no {what}", file=sys.stderr)
             return 2
 
-    clients = {
-        "openalex": OpenAlex(http, config.openalex_api_key),
-        "arxiv": Arxiv(http),
-        "europepmc": EuropePMC(http),
-    }
     wanted = [s.strip() for s in args.sources.split(",") if s.strip()]
     if unknown := set(wanted) - set(SOURCES):
         print(f"error: unknown source(s): {', '.join(sorted(unknown))}", file=sys.stderr)
@@ -213,29 +225,11 @@ def cmd_search(args, config: Config, store: Store, http: HttpClient) -> int:
     if "openalex" in wanted and not config.openalex_api_key:
         print("note: OPENALEX_API_KEY is not set; sharing the anonymous $0.10/day budget.")
 
-    new_total = 0
-    for label, query in to_run:
-        print(f"[{label}] {query}")
-        for name in wanted:
-            params = {"limit": args.limit, "since": args.since, "until": args.until,
-                      "sort": _SORT[name].get(args.sort), "label": label}
-            try:
-                papers = clients[name].search(query, **{k: v for k, v in params.items() if k != "label"})
-            except Exception as exc:  # one source being down should not sink the others
-                store.log_search(topic_id, name, query, params, 0, error=str(exc))
-                store.commit()
-                print(f"  {name:<10} failed: {exc}")
-                continue
-            new_here = 0
-            for paper in papers:
-                paper_id, _ = store.add_paper(paper)
-                new_here += store.link(topic_id, paper_id)
-            store.log_search(topic_id, name, query, params, len(papers))
-            store.commit()
-            new_total += new_here
-            print(f"  {name:<10} {len(papers):>4} results, {new_here:>4} new to topic")
-
-    _rescore(store, topic_id)
+    clients = search_clients(http, config)
+    new_total = sum(run_search(store, clients, topic_id, label, query, wanted, limit=args.limit,
+                               since=args.since, until=args.until, sort=args.sort)
+                    for label, query in to_run)
+    rescore(store, topic_id)
     store.commit()
     print(f"\n{new_total} new papers in '{args.topic}'.")
     if args.show > 0:
@@ -250,7 +244,7 @@ def cmd_queries(args, config: Config, store: Store, http: HttpClient) -> int:
         if not store.remove_query(topic_id, args.remove):
             print(f"error: no query labelled {args.remove!r}", file=sys.stderr)
             return 2
-        _rescore(store, topic_id)
+        rescore(store, topic_id)
         store.commit()
         print(f"Removed [{args.remove}]. Papers it found stay in the topic.")
     rows = store.queries(topic_id)
@@ -263,87 +257,34 @@ def cmd_queries(args, config: Config, store: Store, http: HttpClient) -> int:
 
 def cmd_list(args, config: Config, store: Store, http: HttpClient) -> int:
     topic_id = store.topic_id(args.topic)
-    _rescore(store, topic_id)  # cheap, and keeps scores in step with citation data
+    rescore(store, topic_id)  # cheap, and keeps scores in step with citation data
     store.commit()
     papers = store.topic_papers(topic_id, status=args.status)
     if args.sort != "score":
-        papers = _view(store, topic_id, papers, args.sort)
+        papers = view(store, topic_id, papers, args.sort)
     _print_table(store, topic_id, papers[: args.top])
     return 0
 
 
 def cmd_expand(args, config: Config, store: Store, http: HttpClient) -> int:
     topic_id = store.topic_id(args.topic)
-    openalex = OpenAlex(http, config.openalex_api_key)
-    params = {"seeds": args.seeds, "direction": args.direction, "min_links": args.min_links,
-              "max_new": args.max_new, "since": args.since,
-              "skip_types": [*SKIPPED_TYPES, *(t.strip() for t in args.skip_types.split(",") if t.strip())]}
-    # Score with current citation links first, so the seeds are the topic's best papers.
-    _rescore(store, topic_id)
-    try:
-        result = expand(store, openalex, topic_id, **params)
-    except Exception as exc:
-        store.commit()  # keep whatever was resolved before the failure
-        store.log_search(topic_id, "openalex-expand", "citation expansion", params, 0, error=str(exc))
-        store.commit()
-        print(f"error: expansion failed: {exc}", file=sys.stderr)
+    params = expand_params(args.seeds, args.direction, args.min_links, args.max_new, args.since,
+                           [t.strip() for t in args.skip_types.split(",") if t.strip()])
+    result = run_expand(store, http, config, topic_id, params)
+    if result is None:
         return 1
     added = result.added["backward"] + result.added["forward"]
-    store.log_search(topic_id, "openalex-expand", "citation expansion", params, len(added))
-    _rescore(store, topic_id)
-    store.commit()
-
-    print(f"Matched {result.resolved} more topic papers to OpenAlex"
-          + (f" ({result.unresolved} have no OpenAlex record)" if result.unresolved else "")
-          + f"; refreshed references of {result.refreshed} records.")
-    print(f"Expanded from {result.seeds} seeds (min {args.min_links} links):")
-    if args.direction in ("both", "backward"):
-        print(f"  backward  {result.backward_candidates:>4} candidates, {len(result.added['backward']):>3} added")
-    if args.direction in ("both", "forward"):
-        print(f"  forward   {result.forward_candidates:>4} candidates, {len(result.added['forward']):>3} added")
-    print(f"OpenAlex cost: ${openalex.cost_usd:.4f}")
     if added and args.show > 0:
         newly = [p for p in store.topic_papers(topic_id) if p.id in set(added)][: args.show]
-        print(f"\nTop new papers:\n")
+        print("\nTop new papers:\n")
         _print_table(store, topic_id, newly, notes=True)
     return 0
 
 
 def cmd_fetch(args, config: Config, store: Store, http: HttpClient) -> int:
     topic_id = store.topic_id(args.topic)
-    candidates = store.topic_papers(topic_id, status="new")
-    if args.retry:
-        candidates += store.topic_papers(topic_id, status="unavailable")
-        candidates.sort(key=lambda p: p.score, reverse=True)
-    candidates = [p for p in candidates if p.score >= args.min_score][: args.top]
-    if not candidates:
-        print("Nothing to fetch.")
-        return 0
-
-    acquirer = Acquirer(config, store, http, allow_paid=args.allow_paid)
-    if len(candidates) > 20:
-        print(f"Semantic Scholar lists open-access copies for {acquirer.prefetch(candidates)} "
-              f"of {len(candidates)} papers.")
-    done = {"n": 0, "got": 0}
-
-    def report(paper: StoredPaper, outcome) -> None:
-        done["n"] += 1
-        print(f"[{done['n']}/{len(candidates)}] {_clip(paper.title, 80)}")
-        if outcome.ok:
-            done["got"] += 1
-            kinds = " + ".join(k for k, v in (("pdf", outcome.pdf), ("xml", outcome.xml)) if v)
-            store.set_status(topic_id, paper.id, "downloaded", note=None if outcome.pdf else "xml only")
-            print(f"    ok: {kinds} -> {(outcome.pdf or outcome.xml).parent}")
-        else:
-            store.set_status(topic_id, paper.id, "unavailable", note="no open-access copy downloaded")
-            print(f"    not downloaded; manual: {paper.landing_url or '-'}")
-        if args.verbose or not outcome.ok:
-            for line in outcome.attempts:
-                print(f"      - {line}")
-        store.commit()
-
-    acquirer.fetch_many(candidates, workers=args.workers, on_done=report)
-    print(f"\nDownloaded {done['got']} of {len(candidates)}. Library: {config.papers_dir}")
+    run_fetch(store, http, config, topic_id, top=args.top, retry=args.retry, min_score=args.min_score,
+              workers=args.workers, allow_paid=args.allow_paid, verbose=args.verbose)
     print(f"For the full list with reasons: scientia inventory {args.topic}")
     return 0
 
@@ -365,7 +306,7 @@ def cmd_import(args, config: Config, store: Store, http: HttpClient) -> int:
         counts[result.status] = counts.get(result.status, 0) + 1
         target = ""
         if result.paper_id is not None:
-            target = f" -> [{result.paper_id}] {_clip(store.get_paper(result.paper_id).title, 60)}"
+            target = f" -> [{result.paper_id}] {clip(store.get_paper(result.paper_id).title, 60)}"
         print(f"  {result.status:<12} {path.name}{target}")
         print(f"  {'':<12} {result.detail}")
     print("\n" + ", ".join(f"{n} {status}" for status, n in sorted(counts.items())))
@@ -377,79 +318,23 @@ def cmd_import(args, config: Config, store: Store, http: HttpClient) -> int:
 
 
 def cmd_review(args, config: Config, store: Store, http: HttpClient) -> int:
-    import time
-
     topic_id = store.topic_id(args.topic)
     store.set_review_settings(topic_id, args.question, args.profile)
     store.commit()
-    question, profile = store.review_settings(topic_id)
-    if not question or not profile:
-        print("error: first review of a topic needs --question and --profile", file=sys.stderr)
-        return 2
-    reviewer = Reviewer(store, topic_id, question, profile)
-
-    if not args.dry_run and not os.environ.get("ANTHROPIC_API_KEY"):
-        print("error: ANTHROPIC_API_KEY is not set in this environment (restart the terminal after setx)",
-              file=sys.stderr)
-        return 2
-
-    # 1. Collect any finished batches (and optionally wait for running ones).
-    if not args.dry_run:
-        while True:
-            collected = reviewer.collect()
-            if collected.finished:
-                summary = ", ".join(f"{n} {s}" for s, n in sorted(collected.recorded.items()))
-                print(f"Collected {collected.finished} finished batch(es): {summary}")
-                _rescore(store, topic_id)
-                store.commit()
-            for line in collected.still_running:
-                print(f"Still running: {line}")
-            if not (args.wait and collected.still_running):
-                break
-            time.sleep(30)
-        if collected.still_running and not args.wait:
-            print("Run again later (or with --wait) to collect the results.")
-            return 0
-
-    # 2. Free abstract backfill before triage, so the model sees abstracts where they exist.
-    if args.stage == "triage" and not args.dry_run:
-        filled = backfill_abstracts(store, http, topic_id, config.s2_api_key)
-        store.commit()
-        if filled.checked:
-            print(f"Looked up {filled.checked} missing abstracts: {filled.found_europepmc} from Europe PMC, "
-                  f"{filled.found_semanticscholar} from Semantic Scholar.")
-
-    # 3. Submit what still needs reviewing.
-    papers = reviewer.candidates(args.stage, args.include_tangential)[: args.limit]
-    if not papers:
-        print(f"Nothing left to {args.stage} in '{args.topic}'.")
-        return 0
-    cost = reviewer.estimate_cost(args.stage, papers, batch=not args.sync)
-    model = reviewer.model(args.stage)
-    print(f"{args.stage}: {len(papers)} papers with {model}, estimated ${cost:.2f}"
-          f"{'' if args.sync else ' (batch price)'}")
-    if args.dry_run:
-        return 0
-    if args.sync:
-        counts = reviewer.run_sync(args.stage, papers)
-        print("Done: " + ", ".join(f"{n} {s}" for s, n in sorted(counts.items())))
-        _rescore(store, topic_id)
-        store.commit()
-        return 0
-    batch_id = reviewer.submit_batch(args.stage, papers)
-    print(f"Submitted batch {batch_id}. Most finish within an hour; collect with:\n"
-          f"  scientia review {args.topic} --wait")
-    return 0
+    cost = run_review(store, http, config, topic_id, args.topic, args.stage, limit=args.limit,
+                      include_tangential=args.include_tangential, sync=args.sync, wait=args.wait,
+                      dry_run=args.dry_run, max_cost=args.max_cost)
+    return 2 if cost is None else 0
 
 
 def cmd_evidence(args, config: Config, store: Store, http: HttpClient) -> int:
     topic_id = store.topic_id(args.topic)
-    question, profile = store.review_settings(topic_id)
-    if not question:
+    settings = store.review_settings(topic_id)
+    if not settings["question"]:
         print(f"error: '{args.topic}' has not been reviewed yet; run `scientia review` first", file=sys.stderr)
         return 2
-    md, csv_path = write_evidence(store, topic_id, args.topic, profile or "general", question,
-                                  config.topics_dir / _slug(args.topic))
+    md, csv_path = write_evidence(store, topic_id, args.topic, settings["profile"] or "general",
+                                  settings["question"], config.topics_dir / _slug(args.topic))
     print(f"Wrote {md}\nWrote {csv_path}")
     return 0
 
@@ -457,85 +342,17 @@ def cmd_evidence(args, config: Config, store: Store, http: HttpClient) -> int:
 def cmd_inventory(args, config: Config, store: Store, http: HttpClient) -> int:
     topic_ids = [store.topic_id(t) for t in args.topics]
     if not args.no_refresh:
-        missing = sorted({oid for tid in topic_ids for oid, pid in store.aliases(topic_id=tid).items()
-                          if store.get_paper(pid).oa_status is None})
-        if missing:
-            openalex = OpenAlex(http, config.openalex_api_key)
-            for paper in openalex.get_many(missing):
-                store.add_paper(paper)
-            store.commit()
-            print(f"Fetched open-access status for {len(missing)} OpenAlex records (${openalex.cost_usd:.4f}).")
-
+        refresh_oa_status(store, http, config, topic_ids)
     out = args.out or config.topics_dir / f"inventory-{'+'.join(_slug(t) for t in args.topics)}.csv"
-    counts = write_inventory(store, args.topics, out)
-    groups = ("central/relevant", "tangential/off-topic", "not triaged")
-    accesses = [a for a in ACCESS_ORDER if any(counts.get((g, a)) for g in groups)]
-    width = max(len(a) for a in accesses) if accesses else 10
-    print(f"\n{'':<{width}}  {'central/relevant':>16}  {'other':>6}  {'total':>6}")
-    for a in accesses:
-        cr = counts.get((groups[0], a), 0)
-        other = counts.get((groups[1], a), 0) + counts.get((groups[2], a), 0)
-        print(f"{a:<{width}}  {cr:>16}  {other:>6}  {cr + other:>6}")
-    total_cr = sum(n for (g, _), n in counts.items() if g == groups[0])
-    print(f"{'total':<{width}}  {total_cr:>16}  {sum(counts.values()) - total_cr:>6}  {sum(counts.values()):>6}")
+    print("\n" + format_counts(write_inventory(store, args.topics, out)))
     print(f"\nWrote {out}")
     return 0
 
 
 def cmd_report(args, config: Config, store: Store, http: HttpClient) -> int:
     topic_id = store.topic_id(args.topic)
-    out_dir = config.topics_dir / _slug(args.topic)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "reading-list.md"
-
-    topic_links = store.topic_links(topic_id)
-
-    def entry(p: StoredPaper, with_file: bool) -> str:
-        authors = ", ".join(p.authors[:3]) + (" et al." if len(p.authors) > 3 else "")
-        cited_in, cites_out = topic_links.get(p.id, (0, 0))
-        lines = [f"### {p.tags + ' ' if p.tags else ''}{p.title}",
-                 f"{authors or 'Unknown authors'} · {p.year or 'n.d.'} · {p.venue or '-'} · "
-                 f"cited {p.cited_by or 0} · cited by {cited_in} / cites {cites_out} topic papers · "
-                 f"score {p.score:.2f} · id {p.id}"]
-        links = []
-        if with_file:
-            for kind, row in store.files(p.id).items():
-                rel = _relative(store.resolve(row["path"]), out_dir)
-                links.append(f"[{kind.upper()}]({rel})")
-        if p.landing_url:
-            links.append(f"[source]({p.landing_url})")
-        if links:
-            lines.append(" · ".join(links))
-        if p.note:
-            lines.append(f"*{p.note}*")
-        if p.abstract:
-            lines.append("> " + _clip(p.abstract, 600))
-        return "\n".join(lines)
-
-    sections = [
-        ("Downloaded", store.topic_papers(topic_id, status="downloaded"), True),
-        ("Needs manual retrieval (download via the UNED library into "
-         f"`{config.inbox_dir}`, then run `scientia import --move`)",
-         store.topic_papers(topic_id, status="unavailable"), False),
-        ("Not fetched yet", store.topic_papers(topic_id, status="new", limit=args.pending), False),
-        ("Read", store.topic_papers(topic_id, status="read"), True),
-    ]
-    queries = "\n".join(f"- **{q['label']}**: `{q['query']}`" for q in store.queries(topic_id))
-    parts = [f"# {args.topic}", f"Generated {date.today().isoformat()} from these queries:\n\n{queries}"]
-    core = [p for p in _view(store, topic_id, store.topic_papers(topic_id), "foundational")[:10]
-            if topic_links.get(p.id, (0, 0))[0] > 0]
-    if core:
-        parts.append("## Core papers (most cited within this topic)")
-        parts.append("\n".join(
-            f"{i}. {p.tags + ' ' if p.tags else ''}{p.title} ({p.year or 'n.d.'}) — cited by "
-            f"{topic_links[p.id][0]} topic papers · id {p.id} · {p.status}"
-            for i, p in enumerate(core, 1)
-        ))
-    for title, papers, with_file in sections:
-        if papers:
-            parts.append(f"## {title} ({len(papers)})")
-            parts.extend(entry(p, with_file) for p in papers)
-    path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+    path = write_reading_list(store, topic_id, args.topic, config.topics_dir / _slug(args.topic),
+                              config.inbox_dir, pending=args.pending)
     print(f"Wrote {path}")
     return 0
 
@@ -548,7 +365,7 @@ def cmd_mark(args, config: Config, store: Store, http: HttpClient) -> int:
         return 2
     store.set_status(topic_id, paper.id, args.status, note=args.note)
     store.commit()
-    print(f"{_clip(paper.title, 70)} -> {args.status}")
+    print(f"{clip(paper.title, 70)} -> {args.status}")
     return 0
 
 
@@ -561,7 +378,8 @@ def cmd_info(args, config: Config, store: Store, http: HttpClient) -> int:
     print(f"Contents: {len(store.topics())} topics, {papers} papers, {files} files")
     for name, value in (("OPENALEX_API_KEY", config.openalex_api_key), ("SCIENTIA_EMAIL", config.email),
                         ("UNPAYWALL_EMAIL", config.unpaywall_email if config.unpaywall_email != config.email else None),
-                        ("S2_API_KEY", config.s2_api_key), ("CORE_API_KEY", config.core_api_key)):
+                        ("S2_API_KEY", config.s2_api_key), ("CORE_API_KEY", config.core_api_key),
+                        ("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY"))):
         print(f"{name + ':':<18}{'set' if value else 'not set'}")
     return 0
 
@@ -579,33 +397,6 @@ def cmd_topics(args, config: Config, store: Store, http: HttpClient) -> int:
 
 # -- helpers --------------------------------------------------------------------
 
-def _rescore(store: Store, topic_id: int) -> None:
-    terms = ranking.term_sets([q["query"] for q in store.queries(topic_id)])
-    links = store.topic_links(topic_id)
-    triage = triage_results(store, topic_id)
-    max_links = max((ranking.weighted_links(*l) for l in links.values()), default=0.0)
-    for p in store.topic_papers(topic_id):
-        cited_in, cites_out = links.get(p.id, (0, 0))
-        store.set_score(topic_id, p.id, ranking.score(
-            terms, p.title, p.abstract, p.year, p.cited_by, cited_in=cited_in, cites_out=cites_out,
-            max_links=max_links, llm_relevance=triage.get(p.id, {}).get("relevance")))
-
-
-def _view(store: Store, topic_id: int, papers: list[StoredPaper], view: str) -> list[StoredPaper]:
-    """Reorder papers for one reading purpose instead of the blended score."""
-    links = store.topic_links(topic_id)
-    if view == "foundational":
-        return sorted(papers, key=lambda p: (-links.get(p.id, (0, 0))[0], -p.score))
-    if view == "frontier":
-        # Papers from the last three years, most connected to the topic first.
-        horizon = date.today().year - 3
-        recent = [p for p in papers if (p.year or 0) >= horizon]
-        return sorted(recent, key=lambda p: (-links.get(p.id, (0, 0))[1], -p.score))
-    if view == "recent":
-        return sorted(papers, key=lambda p: (p.published or str(p.year or ""), p.score), reverse=True)
-    return papers
-
-
 def _print_table(store: Store, topic_id: int, papers: list[StoredPaper], notes: bool = False) -> None:
     """`links` is in/out: topic papers citing this one / topic papers it cites."""
     if not papers:
@@ -622,21 +413,13 @@ def _print_table(store: Store, topic_id: int, papers: list[StoredPaper], notes: 
         rel = {"central": "C", "relevant": "R", "tangential": "t", "off_topic": "x"}.get(
             triage.get(p.id, {}).get("relevance"), "")
         print(f"{p.id:>5}  {p.score:>5.2f}  {p.year or '':>4}  {p.cited_by or 0:>6}  {f'{cited_in}/{cites_out}':>5}  "
-              f"{rel:<3} {p.status:<11} {access:<9}  {_clip(title, 70)}")
+              f"{rel:<3} {p.status:<11} {access:<9}  {clip(title, 70)}")
         if notes and p.note:
             print(f"{'':>56}{p.note}")
 
 
-def _clip(text: str, width: int) -> str:
-    return textwrap.shorten(text, width=width, placeholder="…")
-
-
 def _slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9.\-]+", "-", text).strip("-").lower() or "topic"
-
-
-def _relative(path: str, base) -> str:
-    return os.path.relpath(path, base).replace(os.sep, "/")
 
 
 def _iso_date(value: str) -> str:
