@@ -25,6 +25,9 @@ _STOPWORDS = {
 _WEIGHTS = {"relevance": 0.45, "topic_links": 0.25, "citations": 0.15, "recency": 0.15}
 _CITES_OUT_WEIGHT = 0.3  # one outgoing link to the topic is worth 0.3 incoming ones
 _MIN_SATURATION = 5.0  # small topics: don't let 2 links count as "maximally connected"
+# An LLM triage rating, when there is one, replaces the keyword match as the relevance term:
+# it knows that liraglutide is a GLP-1 receptor agonist and that axSpA includes AS.
+LLM_RELEVANCE = {"central": 1.0, "relevant": 0.7, "tangential": 0.25, "off_topic": 0.0}
 
 
 # A parsed query is a list of AND-ed groups; a group is a list of OR-ed alternatives;
@@ -101,16 +104,20 @@ def weighted_links(cited_in: int, cites_out: int) -> float:
 
 def score(queries: list[Query], title: str, abstract: str | None, year: int | None,
           cited_by: int | None, today: date | None = None, *,
-          cited_in: int = 0, cites_out: int = 0, max_links: float = 20.0) -> float:
+          cited_in: int = 0, cites_out: int = 0, max_links: float = 20.0,
+          llm_relevance: str | None = None) -> float:
     """`queries`: from term_sets(); relevance is the best match among them.
     `cited_in`: topic papers citing this one. `cites_out`: topic papers it cites.
     `max_links`: the topic's highest weighted_links, so the link term is relative to the
     topic's best-connected paper (in-degrees of 10 and 80 are both "core" in different topics)."""
     today = today or date.today()
-    relevance = max(
-        (0.6 * _coverage(q, title) + 0.4 * _coverage(q, abstract or title) for q in queries),
-        default=0.0,
-    )
+    if llm_relevance in LLM_RELEVANCE:
+        relevance = LLM_RELEVANCE[llm_relevance]
+    else:
+        relevance = max(
+            (0.6 * _coverage(q, title) + 0.4 * _coverage(q, abstract or title) for q in queries),
+            default=0.0,
+        )
 
     saturation = max(_MIN_SATURATION, max_links)
     topic_links = min(1.0, math.log1p(weighted_links(cited_in, cites_out)) / math.log1p(saturation))

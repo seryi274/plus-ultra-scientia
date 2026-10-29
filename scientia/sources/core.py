@@ -47,7 +47,7 @@ class Core:
         return list(dict.fromkeys(urls))
 
     def _search(self, query: str) -> list[dict[str, Any]]:
-        response = self._http.get(API, params={"q": query, "limit": 5}, headers=self._headers)
+        response = self._http.get(API, params={"q": query, "limit": 5}, headers=self._headers, retries=1)
         if response.status_code != 200:
             raise RuntimeError(f"CORE HTTP {response.status_code}")
         return response.json().get("results", [])

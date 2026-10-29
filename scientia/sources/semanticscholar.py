@@ -28,7 +28,7 @@ class SemanticScholar:
             if not ref:
                 continue
             response = self._http.get(f"{API}/paper/{ref}", params={"fields": _FIELDS},
-                                      headers=self._headers)
+                                      headers=self._headers, retries=1)
             if response.status_code == 200:
                 return _pdf(response.json())
             if response.status_code != 404:
@@ -36,7 +36,7 @@ class SemanticScholar:
         if title:
             response = self._http.get(f"{API}/paper/search/match",
                                       params={"query": title, "fields": _FIELDS},
-                                      headers=self._headers)
+                                      headers=self._headers, retries=1)
             if response.status_code == 200:
                 for hit in response.json().get("data", []):
                     if title_key(hit.get("title") or "") == title_key(title):
@@ -44,6 +44,19 @@ class SemanticScholar:
             elif response.status_code != 404:
                 raise RuntimeError(f"Semantic Scholar HTTP {response.status_code}")
         return None
+
+    def open_pdfs_batch(self, refs: list[str]) -> list[tuple[str, str | None] | None] | None:
+        """open_pdf() for many 'DOI:...' / 'PMID:...' refs, 500 per call, in input order.
+        Returns None if a call fails, so callers can fall back to single lookups."""
+        found: list[tuple[str, str | None] | None] = []
+        for i in range(0, len(refs), 500):
+            chunk = refs[i:i + 500]
+            response = self._http.post(f"{API}/paper/batch", params={"fields": "openAccessPdf"},
+                                       headers=self._headers, json={"ids": chunk})
+            if response.status_code != 200:
+                return None
+            found += [_pdf(record) if record else None for record in response.json()]
+        return found
 
 
 def _pdf(record: dict) -> tuple[str, str | None] | None:

@@ -4,7 +4,7 @@ Routes, cheapest and most reliable first:
   1. arXiv PDF                    (free; paced to 1 request / 3 s)
   2. Europe PMC JATS XML          (free; open-access subset only, the approved PMC route)
   3. Open-access PDF links        (free; from OpenAlex locations and Europe PMC)
-  4. Unpaywall DOI lookup         (free; needs SCIENTIA_EMAIL)
+  4. Unpaywall DOI lookup         (free; needs UNPAYWALL_EMAIL or SCIENTIA_EMAIL)
   5. Semantic Scholar             (free; openAccessPdf by DOI, PMID or exact title)
   6. CORE repository copies       (free; by DOI or exact title, often accepted manuscripts)
   7. OpenAlex cached PDF          (metered at $0.01 per file; only with --allow-paid)
@@ -13,6 +13,12 @@ Subscription content (UNED, Hespérides) is deliberately not fetched here: the l
 forbids automated bulk downloading through its proxy, so papers with no open copy are
 marked 'unavailable' and listed with their DOI link. PDFs you download yourself through
 the library can then be filed with `scientia import` (see importer.py).
+
+Every route tried is recorded (store.fetch_log), so a failed paper can be told apart as
+"a free copy exists but could not be downloaded" or "no free copy is known".
+
+Papers are fetched in parallel worker threads. Workers only do network and file I/O; all
+database writes happen on the calling thread, as each paper completes.
 """
 
 from __future__ import annotations
@@ -20,7 +26,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from scientia.config import Config
@@ -36,14 +44,43 @@ _UNPAYWALL = "https://api.unpaywall.org/v2"
 
 
 @dataclass
+class Attempt:
+    via: str
+    url: str | None
+    # ok, http_<code>, not_pdf (a web page instead of the document), too_large,
+    # network_error, no_link (the lookup found nothing), lookup_failed, skipped_paid, skipped_no_key
+    result: str
+    detail: str = ""
+
+    def describe(self) -> str:
+        where = f" {self.url}" if self.url else ""
+        return f"{self.via}: {self.result}{f' ({self.detail})' if self.detail else ''}{where}"
+
+
+@dataclass
+class SavedFile:
+    kind: str
+    path: Path
+    url: str
+    via: str
+    license: str | None
+    sha256: str
+
+
+@dataclass
 class Outcome:
     pdf: Path | None = None
     xml: Path | None = None
-    attempts: list[str] = field(default_factory=list)  # human-readable log of what was tried
+    tries: list[Attempt] = field(default_factory=list)
+    saved: list[SavedFile] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return self.pdf is not None or self.xml is not None
+
+    @property
+    def attempts(self) -> list[str]:
+        return [t.describe() for t in self.tries]
 
 
 class Acquirer:
@@ -55,29 +92,58 @@ class Acquirer:
         self._s2 = SemanticScholar(http, config.s2_api_key)
         self._core = Core(http, config.core_api_key)
         self._allow_paid = allow_paid
+        self._s2_known: dict[int, tuple[str, str | None] | None] = {}  # filled by prefetch()
+
+    def prefetch(self, papers: list[StoredPaper]) -> int:
+        """Look up Semantic Scholar's open-access links for many papers at once (500 per
+        call) instead of one call per paper during fetch. Returns how many have a link."""
+        refs = {p.id: f"DOI:{p.doi}" if p.doi else f"PMID:{p.pmid}" for p in papers if p.doi or p.pmid}
+        found = self._s2.open_pdfs_batch(list(refs.values()))
+        if found is not None:  # on a failed call, fall back to per-paper lookups
+            self._s2_known.update(zip(refs, found))
+        return sum(1 for v in self._s2_known.values() if v)
 
     def fetch(self, paper: StoredPaper) -> Outcome:
+        return self.fetch_many([paper], workers=1)[0]
+
+    def fetch_many(self, papers: list[StoredPaper], workers: int = 6,
+                   on_done: Callable[[StoredPaper, Outcome], None] | None = None) -> list[Outcome]:
+        """Fetch papers in parallel. `on_done` runs on this thread after each paper's
+        results are stored, in completion order."""
+        existing = {p.id: {kind: self._store.resolve(row["path"]) for kind, row in self._store.files(p.id).items()}
+                    for p in papers}
+        outcomes: dict[int, Outcome] = {}
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(self._fetch_files, p, existing[p.id]): p for p in papers}
+            for future in as_completed(futures):
+                paper = futures[future]
+                outcome = future.result()
+                self._record(paper, outcome)
+                outcomes[paper.id] = outcome
+                if on_done:
+                    on_done(paper, outcome)
+        return [outcomes[p.id] for p in papers]
+
+    # -- worker side: network and files only, no database ------------------------------
+
+    def _fetch_files(self, paper: StoredPaper, existing: dict[str, Path]) -> Outcome:
         outcome = Outcome()
         folder = self._config.papers_dir / paper_slug(paper)
-        existing = self._store.files(paper.id)
 
         if "xml" in existing:
-            outcome.xml = self._store.resolve(existing["xml"]["path"])
+            outcome.xml = existing["xml"]
         elif paper.pmcid and paper.is_oa:
             url = EuropePMC.fulltext_xml_url(paper.pmcid)
             if data := self._download(url, outcome, "europepmc-xml", expect=b"<"):
-                outcome.xml = self._save(paper, folder / "paper.xml", data, "xml", url, "europepmc")
+                outcome.xml = self._save(outcome, folder / "paper.xml", data, "xml", url, "europepmc")
 
         if "pdf" in existing:
-            outcome.pdf = self._store.resolve(existing["pdf"]["path"])
+            outcome.pdf = existing["pdf"]
         else:
             for url, via, license in self._pdf_candidates(paper, outcome):
                 if data := self._download(url, outcome, via, expect=b"%PDF"):
-                    outcome.pdf = self._save(paper, folder / "paper.pdf", data, "pdf", url, via, license)
+                    outcome.pdf = self._save(outcome, folder / "paper.pdf", data, "pdf", url, via, license)
                     break
-
-        if outcome.ok:
-            write_metadata(self._store, paper, folder)
         return outcome
 
     def _pdf_candidates(self, paper: StoredPaper, outcome: Outcome):
@@ -91,7 +157,7 @@ class Acquirer:
             if url not in tried and "arxiv.org/" not in url:
                 tried.add(url)
                 yield url, "oa-link", paper.license
-        if paper.doi and self._config.email:
+        if paper.doi and self._config.unpaywall_email:
             for url, license in self._unpaywall(paper.doi, outcome):
                 if url not in tried:
                     tried.add(url)
@@ -102,71 +168,92 @@ class Acquirer:
                 yield url, via, license
         if paper.openalex_has_pdf and paper.openalex_id:
             if not self._allow_paid:
-                outcome.attempts.append("openalex-content: skipped (costs $0.01; pass --allow-paid)")
+                outcome.tries.append(Attempt("openalex-content", None, "skipped_paid", "costs $0.01; --allow-paid"))
             elif url := self._openalex.content_url(paper.openalex_id):
                 yield url, "openalex-content", paper.license
             else:
-                outcome.attempts.append("openalex-content: skipped (needs OPENALEX_API_KEY)")
+                outcome.tries.append(Attempt("openalex-content", None, "skipped_no_key", "needs OPENALEX_API_KEY"))
 
     def _lookup_routes(self, paper: StoredPaper, outcome: Outcome):
         """Semantic Scholar, then CORE. Each is one or two API calls, so they run only
         when the free direct routes have failed."""
         try:
-            if found := self._s2.open_pdf(doi=paper.doi, pmid=paper.pmid, title=paper.title):
+            if paper.id in self._s2_known:
+                found = self._s2_known[paper.id]
+            else:
+                found = self._s2.open_pdf(doi=paper.doi, pmid=paper.pmid, title=paper.title)
+            if found:
                 yield found[0], "semanticscholar", found[1]
             else:
-                outcome.attempts.append("semanticscholar: no open-access PDF listed")
+                outcome.tries.append(Attempt("semanticscholar", None, "no_link"))
         except Exception as exc:
-            outcome.attempts.append(f"semanticscholar: {exc}")
+            outcome.tries.append(Attempt("semanticscholar", None, "lookup_failed", str(exc)))
         try:
             urls = self._core.open_pdfs(doi=paper.doi, title=paper.title)
             if not urls:
-                outcome.attempts.append("core: no repository copy found")
+                outcome.tries.append(Attempt("core", None, "no_link"))
             for url in urls:
                 yield url, "core", None
         except Exception as exc:
-            outcome.attempts.append(f"core: {exc}")
+            outcome.tries.append(Attempt("core", None, "lookup_failed", str(exc)))
 
     def _unpaywall(self, doi: str, outcome: Outcome) -> list[tuple[str, str | None]]:
-        response = self._http.get(f"{_UNPAYWALL}/{doi}", params={"email": self._config.email})
-        if response.status_code != 200:
-            outcome.attempts.append(f"unpaywall: HTTP {response.status_code}")
+        try:
+            response = self._http.get(f"{_UNPAYWALL}/{doi}", params={"email": self._config.unpaywall_email},
+                                      retries=1)
+        except Exception as exc:
+            outcome.tries.append(Attempt("unpaywall", None, "lookup_failed", type(exc).__name__))
             return []
-        return [
+        if response.status_code != 200:
+            outcome.tries.append(Attempt("unpaywall", None, "lookup_failed", f"HTTP {response.status_code}"))
+            return []
+        found = [
             (loc["url_for_pdf"], loc.get("license"))
             for loc in response.json().get("oa_locations") or []
             if loc.get("url_for_pdf")
         ]
+        if not found:
+            outcome.tries.append(Attempt("unpaywall", None, "no_link"))
+        return found
 
     def _download(self, url: str, outcome: Outcome, via: str, expect: bytes) -> bytes | None:
         label = re.sub(r"api_key=[^&]+", "api_key=***", url)
         try:
             response = self._http.get(url, headers=self._core.headers_for(url))
         except Exception as exc:  # network errors on one route must not stop the others
-            outcome.attempts.append(f"{via}: {type(exc).__name__} for {label}")
+            outcome.tries.append(Attempt(via, label, "network_error", type(exc).__name__))
             return None
         if response.status_code != 200:
-            outcome.attempts.append(f"{via}: HTTP {response.status_code} for {label}")
+            outcome.tries.append(Attempt(via, label, f"http_{response.status_code}"))
             return None
         data = response.content
         if len(data) > _MAX_BYTES:
-            outcome.attempts.append(f"{via}: file too large ({len(data)} bytes) at {label}")
+            outcome.tries.append(Attempt(via, label, "too_large", f"{len(data) // 2**20} MiB"))
             return None
         if not data.lstrip()[:5].startswith(expect):
             # Typically an HTML landing page, login wall or captcha instead of the document.
-            outcome.attempts.append(f"{via}: not a {expect.decode()!r} document at {label}")
+            outcome.tries.append(Attempt(via, label, "not_pdf" if expect == b"%PDF" else "not_xml"))
             return None
-        outcome.attempts.append(f"{via}: ok ({len(data) // 1024} KiB) from {label}")
+        outcome.tries.append(Attempt(via, label, "ok", f"{len(data) // 1024} KiB"))
         return data
 
-    def _save(self, paper: StoredPaper, path: Path, data: bytes, kind: str, url: str, via: str,
+    def _save(self, outcome: Outcome, path: Path, data: bytes, kind: str, url: str, via: str,
               license: str | None = None) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
-        stored_url = re.sub(r"[?&]api_key=[^&]+", "", url)
-        self._store.add_file(paper.id, kind, path, stored_url, via, license,
-                             hashlib.sha256(data).hexdigest())
+        outcome.saved.append(SavedFile(kind, path, re.sub(r"[?&]api_key=[^&]+", "", url), via, license,
+                                       hashlib.sha256(data).hexdigest()))
         return path
+
+    # -- calling thread: database ----------------------------------------------------
+
+    def _record(self, paper: StoredPaper, outcome: Outcome) -> None:
+        for f in outcome.saved:
+            self._store.add_file(paper.id, f.kind, f.path, f.url, f.via, f.license, f.sha256)
+        if outcome.tries:  # nothing tried means the files were already there
+            self._store.save_fetch_log(paper.id, outcome.ok, [asdict(t) for t in outcome.tries])
+        if outcome.saved:
+            write_metadata(self._store, paper, self._config.papers_dir / paper_slug(paper))
 
 
 def write_metadata(store: Store, paper: StoredPaper, folder: Path) -> None:

@@ -20,9 +20,11 @@ Environment variables (all optional):
 | Variable | Purpose |
 |---|---|
 | `OPENALEX_API_KEY` | Free key from <https://openalex.org/settings/api-key>. Gives $1/day of usage; without it your IP shares $0.10/day with everyone else on it. |
-| `SCIENTIA_EMAIL` | Contact address sent in the User-Agent, and required to enable the Unpaywall fallback. |
+| `SCIENTIA_EMAIL` | Contact address sent in the User-Agent of every request; also used for Unpaywall if `UNPAYWALL_EMAIL` isn't set. |
+| `UNPAYWALL_EMAIL` | Address sent **only** to Unpaywall, which requires one to enable its lookup. Use this to keep your address out of every other request. |
 | `S2_API_KEY` | Semantic Scholar key (free). Without it, the shared public pool is often throttled. |
 | `CORE_API_KEY` | CORE key (free, <https://core.ac.uk/services/api>). Raises the rate limit and enables CORE's own download endpoint. |
+| `ANTHROPIC_API_KEY` | Claude API key from <https://platform.claude.com> (billed separately from a Claude subscription). Needed only for `scientia review`. |
 | `SCIENTIA_HOME` | Library location. Default: `~/scientia-library` (`C:\Users\<you>\scientia-library` on Windows), the same whichever folder you run from. |
 
 ## Usage
@@ -45,7 +47,15 @@ scientia expand neural-operators --seeds 25
 scientia list neural-operators --sort foundational   # most cited within the topic
 scientia list neural-operators --sort frontier       # last 3 years, most connected to the topic
 
-scientia fetch neural-operators --top 10 -v   # download open-access PDFs / XML
+# LLM review of abstracts (needs ANTHROPIC_API_KEY): triage every paper, then extract evidence
+scientia review axspa-treatment --profile clinical --question "Which treatments work in axSpA, and who responds?"
+scientia review axspa-treatment --wait                    # collect the batch when it finishes
+scientia review axspa-treatment --stage extract --dry-run # cost estimate first
+scientia review axspa-treatment --stage extract --wait
+scientia evidence axspa-treatment                         # evidence.md + evidence.csv
+
+scientia fetch neural-operators --top 10 -v   # download open-access PDFs / XML (6 in parallel)
+scientia inventory axspa-treatment axspa-genetics-immunology   # every paper, relevance + access, as CSV
 scientia report neural-operators              # <library>/topics/neural-operators/reading-list.md
 scientia import --move                        # file PDFs you saved into <library>/inbox/
 scientia mark neural-operators 12 read --note "key idea: spectral convolution"
@@ -77,7 +87,7 @@ bytes, because publisher "PDF" links often return an HTML landing page instead.
 2. **Europe PMC full-text XML** – open-access subset only. This is the approved way to
    retrieve PMC content automatically.
 3. **Open-access links** reported by OpenAlex / Europe PMC.
-4. **Unpaywall** by DOI – only when `SCIENTIA_EMAIL` is set.
+4. **Unpaywall** by DOI – only when `UNPAYWALL_EMAIL` or `SCIENTIA_EMAIL` is set.
 5. **Semantic Scholar** `openAccessPdf`, by DOI, PMID or exact title.
 6. **CORE** – repository copies, often accepted manuscripts of paywalled articles. Found
    by DOI or exact title and downloaded from the original repository. CORE's own
@@ -86,6 +96,24 @@ bytes, because publisher "PDF" links often return an HTML landing page instead.
 
 Papers with no open copy are marked `unavailable`. The reading list shows them with their
 DOI link so you can retrieve them by hand through the UNED library.
+
+Papers are fetched in parallel (`--workers`, default 6). The HTTP client hands out per-site
+time slots, so each site's rate limit still holds. Before the downloads, Semantic Scholar is
+asked about all candidates at once (500 per call). Every route tried, with its result, is
+saved per paper.
+
+`scientia inventory <topic>...` writes every paper of one or more topics to a CSV that opens
+in Excel. Each row has its relevance rating, study design, OpenAlex open-access status and
+an **access** category:
+
+- `downloaded (PDF)`, or `downloaded (XML only)`;
+- `free copy, download failed`: a legal free copy exists, but the publisher blocked the
+  script, or the link returned a web page. Usually downloadable by hand in a browser.
+- `free copy, OpenAlex cache`: only OpenAlex's cached PDF ($0.01 with `--allow-paid`);
+- `licence needed`: no free copy is known; get it via the library, then `scientia import`;
+- `not attempted yet`.
+
+An "access detail" column gives the reason.
 
 ### Importing PDFs you downloaded yourself
 
@@ -168,10 +196,48 @@ lists open with a *Core papers* section.
 
 Papers are tagged `[RETRACTED]` (from OpenAlex) and `[review]`, `[editorial]`… by work type.
 
+## LLM review
+
+`scientia review` sends each paper's title and abstract to Claude through the Message
+Batches API, which costs half price and usually returns within an hour. Every request uses
+structured outputs, so each result is JSON in a fixed schema. It runs in two stages:
+
+1. **Triage** (`claude-haiku-5-5`, every paper) gives:
+   - relevance to the topic's research question: central / relevant / tangential / off-topic, with a one-sentence reason;
+   - the study design;
+   - key terms: drugs, genes, pathways, biomarkers.
+
+   Before triage, missing abstracts are looked up for free: Europe PMC by PMID, then
+   Semantic Scholar by DOI. Some publishers block their abstracts in both, so those papers
+   are triaged on the title alone. The triage rating replaces the keyword match in the
+   ranking. `list` shows it in the `rel` column: C(entral), R(elevant), t(angential), x (off-topic).
+2. **Extraction** (`claude-opus-5-5`) covers central and relevant papers that have an
+   abstract. It never starts unless asked with `--stage extract`. The schema follows the
+   topic's `--profile`:
+   - `clinical`: population, interventions with drug class, comparator, outcomes, response predictors, limitations, open questions;
+   - `genetics`: genes and variants, pathways, cell types, data types, findings with their evidence, public datasets, therapeutic implications;
+   - `general`.
+
+   The model may record only what the abstract states, copying numbers as written.
+
+Only abstracts are sent, never licensed full text. Re-running is safe: papers in a running
+batch, or already reviewed, are not sent again. Failed or truncated results are retried.
+`--sync` sends requests one by one at full price, for small tests. In that mode, Opus
+requests opt into server-side refusal fallbacks (`fallbacks: "default"`); the Batches API
+doesn't accept that option.
+
+`scientia evidence <topic>` turns the extractions into `evidence.md` and `evidence.csv`. For
+a clinical topic, that means evidence tables by drug class, plus reported response
+predictors and open questions. For a genetics topic, it means the most-studied genes and
+pathways, key findings, public datasets and stated therapeutic implications.
+
+Costs on the AS pilot (about 700 papers per topic): triage about $0.13 per topic, and
+extraction about $0.013 per paper at batch price.
+
 ## Next steps
 
-- Embedding-based re-ranking and LLM relevance review with structured output.
-- Structured extraction per paper (problem, methods, assumptions, claims with locations, limitations).
+- A bridge report across topics: shared key terms, and genetics findings that bear on treatment questions.
+- Full-text extraction for the shortlist (Europe PMC JATS first), once UNED confirms what may be processed.
 - Scheduled monitoring (weekly `search --sort recent` plus a digest).
 - Publisher TDM clients, once UNED confirms entitlement.
 

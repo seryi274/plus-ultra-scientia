@@ -179,6 +179,7 @@ def parse_work(work: dict[str, Any]) -> Paper:
         landing_url=work.get("doi") or primary.get("landing_page_url"),
         work_type=work.get("type"),
         is_retracted=work.get("is_retracted"),
+        oa_status=(work.get("open_access") or {}).get("oa_status"),
         references=(
             [r for r in map(_last_path_segment, work["referenced_works"]) if r]
             if "referenced_works" in work else None

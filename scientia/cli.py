@@ -7,6 +7,10 @@
     scientia expand <topic> [--seeds 25] [--direction both] [--min-links 2]
     scientia fetch  <topic> [--top 10] [--min-score 0.5] [--allow-paid]
     scientia import [pdfs or folders] [--topic <topic>] [--move]
+    scientia review <topic> --question "..." --profile clinical|genetics|general
+    scientia review <topic> --stage extract [--wait]
+    scientia evidence <topic>
+    scientia inventory <topic> [<topic> ...]
     scientia report <topic>
     scientia mark   <topic> <paper> read|skipped|new
     scientia topics
@@ -24,11 +28,15 @@ from datetime import date
 from pathlib import Path
 
 from scientia import ranking
+from scientia.abstracts import backfill_abstracts
 from scientia.acquire import Acquirer
 from scientia.config import Config
+from scientia.evidence import write_evidence
 from scientia.expand import expand
 from scientia.importer import Importer, pdf_files
+from scientia.inventory import ACCESS_ORDER, write_inventory
 from scientia.net import HttpClient
+from scientia.review import PROFILES, Reviewer, triage_results
 from scientia.sources.arxiv import Arxiv
 from scientia.sources.europepmc import EuropePMC
 from scientia.sources.openalex import OpenAlex
@@ -118,6 +126,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-paid", action="store_true",
                    help="allow OpenAlex cached-PDF downloads ($0.01 each, from your daily budget)")
     p.add_argument("-v", "--verbose", action="store_true", help="show every route tried")
+    p.add_argument("--workers", type=int, default=6,
+                   help="papers fetched in parallel (each site's rate limit still applies; default 6)")
     p.set_defaults(handler=cmd_fetch)
 
     p = sub.add_parser("import", help="file PDFs you downloaded yourself (e.g. via the UNED library)")
@@ -127,6 +137,33 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--move", action="store_true", help="move files instead of copying them")
     p.add_argument("--force", action="store_true", help="replace a PDF the paper already has")
     p.set_defaults(handler=cmd_import)
+
+    p = sub.add_parser("review", help="LLM review of abstracts: Haiku triage, then Opus evidence extraction")
+    p.add_argument("topic")
+    p.add_argument("--question", help="the research question papers are judged against (saved on the topic)")
+    p.add_argument("--profile", choices=tuple(PROFILES),
+                   help="extraction schema (saved on the topic): clinical, genetics or general")
+    p.add_argument("--stage", choices=("triage", "extract"), default="triage",
+                   help="triage = relevance and design for every paper (Haiku); "
+                        "extract = evidence from central/relevant papers (Opus)")
+    p.add_argument("--include-tangential", action="store_true", help="extract: also papers rated tangential")
+    p.add_argument("--limit", type=int, help="review at most this many papers")
+    p.add_argument("--sync", action="store_true",
+                   help="send requests one at a time instead of a batch (full price; for small runs)")
+    p.add_argument("--wait", action="store_true", help="wait for submitted batches to finish and collect them")
+    p.add_argument("--dry-run", action="store_true", help="show what would be reviewed and the cost estimate")
+    p.set_defaults(handler=cmd_review)
+
+    p = sub.add_parser("evidence", help="write evidence tables (Markdown + CSV) from a topic's reviews")
+    p.add_argument("topic")
+    p.set_defaults(handler=cmd_evidence)
+
+    p = sub.add_parser("inventory", help="full paper list with relevance and access status, as CSV")
+    p.add_argument("topics", nargs="+", help="one or more topics; a paper in several appears once")
+    p.add_argument("--out", type=Path, help="CSV path (default: <library>/topics/inventory-<topics>.csv)")
+    p.add_argument("--no-refresh", action="store_true",
+                   help="don't fetch missing open-access statuses from OpenAlex (about $0.0001 per 100 papers)")
+    p.set_defaults(handler=cmd_inventory)
 
     p = sub.add_parser("report", help="write a Markdown reading list for a topic")
     p.add_argument("topic")
@@ -284,23 +321,30 @@ def cmd_fetch(args, config: Config, store: Store, http: HttpClient) -> int:
         return 0
 
     acquirer = Acquirer(config, store, http, allow_paid=args.allow_paid)
-    got = 0
-    for i, paper in enumerate(candidates, 1):
-        print(f"[{i}/{len(candidates)}] {_clip(paper.title, 80)}")
-        outcome = acquirer.fetch(paper)
+    if len(candidates) > 20:
+        print(f"Semantic Scholar lists open-access copies for {acquirer.prefetch(candidates)} "
+              f"of {len(candidates)} papers.")
+    done = {"n": 0, "got": 0}
+
+    def report(paper: StoredPaper, outcome) -> None:
+        done["n"] += 1
+        print(f"[{done['n']}/{len(candidates)}] {_clip(paper.title, 80)}")
         if outcome.ok:
-            got += 1
+            done["got"] += 1
             kinds = " + ".join(k for k, v in (("pdf", outcome.pdf), ("xml", outcome.xml)) if v)
             store.set_status(topic_id, paper.id, "downloaded", note=None if outcome.pdf else "xml only")
             print(f"    ok: {kinds} -> {(outcome.pdf or outcome.xml).parent}")
         else:
-            store.set_status(topic_id, paper.id, "unavailable", note="no open-access copy found")
-            print(f"    no open-access copy; manual: {paper.landing_url or '-'}")
+            store.set_status(topic_id, paper.id, "unavailable", note="no open-access copy downloaded")
+            print(f"    not downloaded; manual: {paper.landing_url or '-'}")
         if args.verbose or not outcome.ok:
             for line in outcome.attempts:
                 print(f"      - {line}")
         store.commit()
-    print(f"\nDownloaded {got} of {len(candidates)}. Library: {config.papers_dir}")
+
+    acquirer.fetch_many(candidates, workers=args.workers, on_done=report)
+    print(f"\nDownloaded {done['got']} of {len(candidates)}. Library: {config.papers_dir}")
+    print(f"For the full list with reasons: scientia inventory {args.topic}")
     return 0
 
 
@@ -329,6 +373,112 @@ def cmd_import(args, config: Config, store: Store, http: HttpClient) -> int:
         hint = " --topic <topic>" if not args.topic else ""
         print(f"Unmatched files were left in place. Run `scientia search` for them first, or retry with{hint}"
               " if they carry a DOI.")
+    return 0
+
+
+def cmd_review(args, config: Config, store: Store, http: HttpClient) -> int:
+    import time
+
+    topic_id = store.topic_id(args.topic)
+    store.set_review_settings(topic_id, args.question, args.profile)
+    store.commit()
+    question, profile = store.review_settings(topic_id)
+    if not question or not profile:
+        print("error: first review of a topic needs --question and --profile", file=sys.stderr)
+        return 2
+    reviewer = Reviewer(store, topic_id, question, profile)
+
+    if not args.dry_run and not os.environ.get("ANTHROPIC_API_KEY"):
+        print("error: ANTHROPIC_API_KEY is not set in this environment (restart the terminal after setx)",
+              file=sys.stderr)
+        return 2
+
+    # 1. Collect any finished batches (and optionally wait for running ones).
+    if not args.dry_run:
+        while True:
+            collected = reviewer.collect()
+            if collected.finished:
+                summary = ", ".join(f"{n} {s}" for s, n in sorted(collected.recorded.items()))
+                print(f"Collected {collected.finished} finished batch(es): {summary}")
+                _rescore(store, topic_id)
+                store.commit()
+            for line in collected.still_running:
+                print(f"Still running: {line}")
+            if not (args.wait and collected.still_running):
+                break
+            time.sleep(30)
+        if collected.still_running and not args.wait:
+            print("Run again later (or with --wait) to collect the results.")
+            return 0
+
+    # 2. Free abstract backfill before triage, so the model sees abstracts where they exist.
+    if args.stage == "triage" and not args.dry_run:
+        filled = backfill_abstracts(store, http, topic_id, config.s2_api_key)
+        store.commit()
+        if filled.checked:
+            print(f"Looked up {filled.checked} missing abstracts: {filled.found_europepmc} from Europe PMC, "
+                  f"{filled.found_semanticscholar} from Semantic Scholar.")
+
+    # 3. Submit what still needs reviewing.
+    papers = reviewer.candidates(args.stage, args.include_tangential)[: args.limit]
+    if not papers:
+        print(f"Nothing left to {args.stage} in '{args.topic}'.")
+        return 0
+    cost = reviewer.estimate_cost(args.stage, papers, batch=not args.sync)
+    model = reviewer.model(args.stage)
+    print(f"{args.stage}: {len(papers)} papers with {model}, estimated ${cost:.2f}"
+          f"{'' if args.sync else ' (batch price)'}")
+    if args.dry_run:
+        return 0
+    if args.sync:
+        counts = reviewer.run_sync(args.stage, papers)
+        print("Done: " + ", ".join(f"{n} {s}" for s, n in sorted(counts.items())))
+        _rescore(store, topic_id)
+        store.commit()
+        return 0
+    batch_id = reviewer.submit_batch(args.stage, papers)
+    print(f"Submitted batch {batch_id}. Most finish within an hour; collect with:\n"
+          f"  scientia review {args.topic} --wait")
+    return 0
+
+
+def cmd_evidence(args, config: Config, store: Store, http: HttpClient) -> int:
+    topic_id = store.topic_id(args.topic)
+    question, profile = store.review_settings(topic_id)
+    if not question:
+        print(f"error: '{args.topic}' has not been reviewed yet; run `scientia review` first", file=sys.stderr)
+        return 2
+    md, csv_path = write_evidence(store, topic_id, args.topic, profile or "general", question,
+                                  config.topics_dir / _slug(args.topic))
+    print(f"Wrote {md}\nWrote {csv_path}")
+    return 0
+
+
+def cmd_inventory(args, config: Config, store: Store, http: HttpClient) -> int:
+    topic_ids = [store.topic_id(t) for t in args.topics]
+    if not args.no_refresh:
+        missing = sorted({oid for tid in topic_ids for oid, pid in store.aliases(topic_id=tid).items()
+                          if store.get_paper(pid).oa_status is None})
+        if missing:
+            openalex = OpenAlex(http, config.openalex_api_key)
+            for paper in openalex.get_many(missing):
+                store.add_paper(paper)
+            store.commit()
+            print(f"Fetched open-access status for {len(missing)} OpenAlex records (${openalex.cost_usd:.4f}).")
+
+    out = args.out or config.topics_dir / f"inventory-{'+'.join(_slug(t) for t in args.topics)}.csv"
+    counts = write_inventory(store, args.topics, out)
+    groups = ("central/relevant", "tangential/off-topic", "not triaged")
+    accesses = [a for a in ACCESS_ORDER if any(counts.get((g, a)) for g in groups)]
+    width = max(len(a) for a in accesses) if accesses else 10
+    print(f"\n{'':<{width}}  {'central/relevant':>16}  {'other':>6}  {'total':>6}")
+    for a in accesses:
+        cr = counts.get((groups[0], a), 0)
+        other = counts.get((groups[1], a), 0) + counts.get((groups[2], a), 0)
+        print(f"{a:<{width}}  {cr:>16}  {other:>6}  {cr + other:>6}")
+    total_cr = sum(n for (g, _), n in counts.items() if g == groups[0])
+    print(f"{'total':<{width}}  {total_cr:>16}  {sum(counts.values()) - total_cr:>6}  {sum(counts.values()):>6}")
+    print(f"\nWrote {out}")
     return 0
 
 
@@ -410,6 +560,7 @@ def cmd_info(args, config: Config, store: Store, http: HttpClient) -> int:
     print(f"Inbox:    {config.inbox_dir}")
     print(f"Contents: {len(store.topics())} topics, {papers} papers, {files} files")
     for name, value in (("OPENALEX_API_KEY", config.openalex_api_key), ("SCIENTIA_EMAIL", config.email),
+                        ("UNPAYWALL_EMAIL", config.unpaywall_email if config.unpaywall_email != config.email else None),
                         ("S2_API_KEY", config.s2_api_key), ("CORE_API_KEY", config.core_api_key)):
         print(f"{name + ':':<18}{'set' if value else 'not set'}")
     return 0
@@ -431,12 +582,13 @@ def cmd_topics(args, config: Config, store: Store, http: HttpClient) -> int:
 def _rescore(store: Store, topic_id: int) -> None:
     terms = ranking.term_sets([q["query"] for q in store.queries(topic_id)])
     links = store.topic_links(topic_id)
+    triage = triage_results(store, topic_id)
     max_links = max((ranking.weighted_links(*l) for l in links.values()), default=0.0)
     for p in store.topic_papers(topic_id):
         cited_in, cites_out = links.get(p.id, (0, 0))
-        store.set_score(topic_id, p.id, ranking.score(terms, p.title, p.abstract, p.year, p.cited_by,
-                                                      cited_in=cited_in, cites_out=cites_out,
-                                                      max_links=max_links))
+        store.set_score(topic_id, p.id, ranking.score(
+            terms, p.title, p.abstract, p.year, p.cited_by, cited_in=cited_in, cites_out=cites_out,
+            max_links=max_links, llm_relevance=triage.get(p.id, {}).get("relevance")))
 
 
 def _view(store: Store, topic_id: int, papers: list[StoredPaper], view: str) -> list[StoredPaper]:
@@ -460,13 +612,17 @@ def _print_table(store: Store, topic_id: int, papers: list[StoredPaper], notes: 
         print("(no papers)")
         return
     links = store.topic_links(topic_id)
-    print(f"{'id':>5}  {'score':>5}  {'year':>4}  {'cites':>6}  {'links':>5}  {'status':<11} {'full text':<9}  title")
+    triage = triage_results(store, topic_id)
+    print(f"{'id':>5}  {'score':>5}  {'year':>4}  {'cites':>6}  {'links':>5}  {'rel':<3} {'status':<11} "
+          f"{'full text':<9}  title")
     for p in papers:
         access = "arXiv" if p.arxiv_id else ("OA" if p.is_oa else ("cached" if p.openalex_has_pdf else "-"))
         cited_in, cites_out = links.get(p.id, (0, 0))
         title = f"{p.tags} {p.title}" if p.tags else p.title
+        rel = {"central": "C", "relevant": "R", "tangential": "t", "off_topic": "x"}.get(
+            triage.get(p.id, {}).get("relevance"), "")
         print(f"{p.id:>5}  {p.score:>5.2f}  {p.year or '':>4}  {p.cited_by or 0:>6}  {f'{cited_in}/{cites_out}':>5}  "
-              f"{p.status:<11} {access:<9}  {_clip(title, 70)}")
+              f"{rel:<3} {p.status:<11} {access:<9}  {_clip(title, 70)}")
         if notes and p.note:
             print(f"{'':>56}{p.note}")
 

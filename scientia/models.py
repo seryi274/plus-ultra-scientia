@@ -85,6 +85,7 @@ class Paper:
     landing_url: str | None = None
     work_type: str | None = None  # OpenAlex type: article, review, preprint, book-chapter...
     is_retracted: bool | None = None
+    oa_status: str | None = None  # OpenAlex: gold, green, hybrid, bronze, diamond or closed
     # OpenAlex ids of the works this one cites; None when the source doesn't say.
     references: list[str] | None = None
 

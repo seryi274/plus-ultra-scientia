@@ -116,10 +116,49 @@ CREATE TABLE IF NOT EXISTS citations (
     PRIMARY KEY (citing, cited)
 );
 CREATE INDEX IF NOT EXISTS citations_cited ON citations(cited);
+
+-- LLM reviews of a paper for a topic: 'triage' (relevance, design) and 'extract' (evidence).
+-- status: pending (in a submitted batch), ok, refused, truncated, error.
+CREATE TABLE IF NOT EXISTS reviews (
+    topic_id       INTEGER NOT NULL REFERENCES topics(id),
+    paper_id       INTEGER NOT NULL REFERENCES papers(id),
+    stage          TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    batch_id       TEXT,
+    result         TEXT,            -- JSON matching the stage's schema
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    cost_usd       REAL NOT NULL DEFAULT 0,
+    updated        TEXT NOT NULL,
+    PRIMARY KEY (topic_id, paper_id, stage)
+);
+
+-- The latest full-text fetch attempt per paper: every route tried and what happened.
+CREATE TABLE IF NOT EXISTS fetch_log (
+    paper_id      INTEGER PRIMARY KEY REFERENCES papers(id),
+    attempted_at  TEXT NOT NULL,
+    succeeded     INTEGER NOT NULL,
+    attempts      TEXT NOT NULL     -- JSON list of {via, url, result, detail}
+);
+
+CREATE TABLE IF NOT EXISTS review_batches (
+    batch_id      TEXT PRIMARY KEY,
+    topic_id      INTEGER NOT NULL REFERENCES topics(id),
+    stage         TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    requests      INTEGER NOT NULL,
+    submitted_at  TEXT NOT NULL,
+    collected_at  TEXT
+);
 """
 
 # Columns added after the first release, applied to existing databases on open.
-_ADDED_COLUMNS = {"papers": [("work_type", "TEXT"), ("is_retracted", "INTEGER")]}
+_ADDED_COLUMNS = {
+    "papers": [("work_type", "TEXT"), ("is_retracted", "INTEGER"),
+               ("abstract_source", "TEXT"), ("abstract_checked", "TEXT"), ("oa_status", "TEXT")],
+    "topics": [("review_question", "TEXT"), ("review_profile", "TEXT")],
+}
 
 
 def _now() -> str:
@@ -310,13 +349,14 @@ class Store:
         cur = self.conn.execute(
             """INSERT INTO papers (title, title_key, abstract, authors, year, published, venue,
                    doi, arxiv_id, pmid, pmcid, openalex_id, cited_by, is_oa, license, pdf_urls,
-                   openalex_has_pdf, landing_url, sources, first_seen, updated, work_type, is_retracted)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   openalex_has_pdf, landing_url, sources, first_seen, updated, work_type, is_retracted,
+                   oa_status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (p.title, title_key(p.title), p.abstract, json.dumps(p.authors), p.year, p.published,
              p.venue, p.doi, p.arxiv_id, p.pmid, p.pmcid, p.openalex_id, p.cited_by,
              None if p.is_oa is None else int(p.is_oa), p.license, json.dumps(p.pdf_urls),
              int(p.openalex_has_pdf), p.landing_url, json.dumps([p.source]), now, now,
-             p.work_type, None if p.is_retracted is None else int(p.is_retracted)),
+             p.work_type, None if p.is_retracted is None else int(p.is_retracted), p.oa_status),
         )
         return cur.lastrowid
 
@@ -337,6 +377,8 @@ class Store:
             updates["is_oa"] = 1
         if p.openalex_has_pdf and not row["openalex_has_pdf"]:
             updates["openalex_has_pdf"] = 1
+        if p.oa_status and p.oa_status != row["oa_status"]:
+            updates["oa_status"] = p.oa_status  # can change, e.g. when an embargo ends
         if p.is_retracted is not None and (p.is_retracted or row["is_retracted"] is None):
             updates["is_retracted"] = int(p.is_retracted)  # a retraction is sticky
         urls = json.loads(row["pdf_urls"])
@@ -464,6 +506,64 @@ class Store:
             "UPDATE topic_papers SET note = ? WHERE topic_id = ? AND paper_id = ?", (note, topic_id, paper_id)
         )
 
+    def set_abstract(self, paper_id: int, abstract: str, source: str) -> None:
+        self.conn.execute(
+            "UPDATE papers SET abstract = ?, abstract_source = ?, abstract_checked = ?, updated = ? WHERE id = ?",
+            (abstract, source, _now(), _now(), paper_id),
+        )
+
+    def mark_abstract_checked(self, paper_id: int) -> None:
+        self.conn.execute("UPDATE papers SET abstract_checked = ? WHERE id = ?", (_now(), paper_id))
+
+    # -- reviews ------------------------------------------------------------------
+
+    def review_settings(self, topic_id: int) -> tuple[str | None, str | None]:
+        row = self.conn.execute(
+            "SELECT review_question, review_profile FROM topics WHERE id = ?", (topic_id,)
+        ).fetchone()
+        return row["review_question"], row["review_profile"]
+
+    def set_review_settings(self, topic_id: int, question: str | None, profile: str | None) -> None:
+        self.conn.execute(
+            """UPDATE topics SET review_question = COALESCE(?, review_question),
+                                 review_profile = COALESCE(?, review_profile) WHERE id = ?""",
+            (question, profile, topic_id),
+        )
+
+    def save_review(self, topic_id: int, paper_id: int, stage: str, status: str, model: str, *,
+                    batch_id: str | None = None, result: str | None = None, input_tokens: int = 0,
+                    output_tokens: int = 0, cost_usd: float = 0.0) -> None:
+        self.conn.execute(
+            """INSERT INTO reviews (topic_id, paper_id, stage, status, model, batch_id, result,
+                   input_tokens, output_tokens, cost_usd, updated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (topic_id, paper_id, stage) DO UPDATE SET status = excluded.status,
+                   model = excluded.model, batch_id = excluded.batch_id, result = excluded.result,
+                   input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
+                   cost_usd = excluded.cost_usd, updated = excluded.updated""",
+            (topic_id, paper_id, stage, status, model, batch_id, result, input_tokens, output_tokens,
+             cost_usd, _now()),
+        )
+
+    def reviews(self, topic_id: int, stage: str) -> dict[int, sqlite3.Row]:
+        return {r["paper_id"]: r for r in self.conn.execute(
+            "SELECT * FROM reviews WHERE topic_id = ? AND stage = ?", (topic_id, stage))}
+
+    def add_review_batch(self, batch_id: str, topic_id: int, stage: str, model: str, requests: int) -> None:
+        self.conn.execute(
+            "INSERT INTO review_batches (batch_id, topic_id, stage, model, requests, submitted_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (batch_id, topic_id, stage, model, requests, _now()),
+        )
+
+    def open_review_batches(self, topic_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM review_batches WHERE topic_id = ? AND collected_at IS NULL ORDER BY submitted_at",
+            (topic_id,),
+        ).fetchall()
+
+    def close_review_batch(self, batch_id: str) -> None:
+        self.conn.execute("UPDATE review_batches SET collected_at = ? WHERE batch_id = ?", (_now(), batch_id))
+
     # -- citations ----------------------------------------------------------------
 
     def set_references(self, citing: str, cited: list[str]) -> None:
@@ -555,6 +655,17 @@ class Store:
                    retrieved_at = excluded.retrieved_at""",
             (paper_id, kind, self._to_stored(path), url, via, license, sha256, _now()),
         )
+
+    def save_fetch_log(self, paper_id: int, succeeded: bool, attempts: list[dict]) -> None:
+        self.conn.execute(
+            """INSERT INTO fetch_log (paper_id, attempted_at, succeeded, attempts) VALUES (?, ?, ?, ?)
+               ON CONFLICT (paper_id) DO UPDATE SET attempted_at = excluded.attempted_at,
+                   succeeded = excluded.succeeded, attempts = excluded.attempts""",
+            (paper_id, _now(), int(succeeded), json.dumps(attempts)),
+        )
+
+    def fetch_logs(self) -> dict[int, sqlite3.Row]:
+        return {r["paper_id"]: r for r in self.conn.execute("SELECT * FROM fetch_log")}
 
     def file_with_hash(self, sha256: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM files WHERE sha256 = ?", (sha256,)).fetchone()

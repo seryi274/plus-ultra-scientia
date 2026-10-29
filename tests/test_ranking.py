@@ -37,7 +37,6 @@ def test_or_alternatives_and_multiple_queries_each_match_fully():
     assert old_name == new_name == drug > unrelated
 
 
-
 def test_grouped_queries_need_one_alternative_per_group():
     [q] = term_sets(['("ankylosing spondylitis" OR "axial spondyloarthritis") AND (secukinumab OR ixekizumab) NOT psoriasis'])
     assert q == [[["ankylosing", "spondyliti"], ["axial", "spondyloarthriti"]], [["secukinumab"], ["ixekizumab"]]]
