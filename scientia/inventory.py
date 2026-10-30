@@ -100,7 +100,7 @@ def write_inventory(store: Store, topic_names: list[str], path: Path) -> dict[tu
             "open access status": p.oa_status or "",
             "access": access,
             "access detail": detail,
-            "file": str(store.resolve(file_path["path"])) if file_path else "",
+            "file": file_path["path"] if file_path else "",  # relative to the library root (scientia info)
             "doi link": f"https://doi.org/{p.doi}" if p.doi else (p.landing_url or ""),
             "cited by": p.cited_by or 0,
         })
