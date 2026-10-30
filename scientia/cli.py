@@ -17,6 +17,7 @@
     scientia mark   <topic> <paper> read|skipped|new
     scientia topics
     scientia info
+    scientia backup <folder>
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from scientia.backup import backup_library
 from scientia.config import Config
 from scientia.evidence import write_evidence
 from scientia.importer import Importer, pdf_files
@@ -186,6 +188,10 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("info", help="show the library location and which API keys are set")
     p.set_defaults(handler=cmd_info)
+
+    p = sub.add_parser("backup", help="copy the library (database, papers, outputs) to another folder")
+    p.add_argument("dest", type=Path, help="backup folder, e.g. one synced by Google Drive")
+    p.set_defaults(handler=cmd_backup)
     return parser
 
 
@@ -381,6 +387,17 @@ def cmd_info(args, config: Config, store: Store, http: HttpClient) -> int:
                         ("S2_API_KEY", config.s2_api_key), ("CORE_API_KEY", config.core_api_key),
                         ("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY"))):
         print(f"{name + ':':<18}{'set' if value else 'not set'}")
+    return 0
+
+
+def cmd_backup(args, config: Config, store: Store, http: HttpClient) -> int:
+    try:
+        result = backup_library(config, store, args.dest)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"Backed up {config.home} to {args.dest.resolve()}: {result.copied} files copied "
+          f"({result.bytes_copied / 2**20:.1f} MiB), {result.unchanged} unchanged.")
     return 0
 
 

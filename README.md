@@ -269,6 +269,21 @@ pathways, key findings, public datasets and stated therapeutic implications.
 Costs on the AS pilot (about 700 papers per topic): triage about $0.13 per topic, and
 extraction about $0.013 per paper at batch price.
 
+## Backing up the library
+
+The library (database and PDFs) is never versioned. Back it up to a folder synced by
+Google Drive or OneDrive instead:
+
+```powershell
+scientia backup "G:\My Drive\scientia-library-backup"
+```
+
+The database is copied with SQLite's online backup API, so the copy is consistent even
+while the library is in use. Papers and outputs are copied incrementally, and nothing is
+ever deleted at the destination. Keep working from the local library: a sync client
+rewriting `research.db` while SQLite writes to it can corrupt it. To restore, copy the
+backup to a local disk and point `SCIENTIA_HOME` at it.
+
 ## Robustness
 
 If a lookup service fails 12 times in a row during a fetch (CORE, Semantic Scholar,
