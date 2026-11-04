@@ -291,6 +291,13 @@ Unpaywall, Europe PMC XML), it is switched off for the rest of the run. Its atte
 then recorded as `skipped_disabled`, so an outage costs seconds instead of hours.
 Optional lookups are retried once, not with the full backoff.
 
+Requests are paced per site, not per host. Large publishers count as a single site across
+all their domains: Elsevier's doi.org redirects, linkinghub, sciencedirect.com and cell.com
+share one budget of one request every 4 seconds (`PUBLISHER_INTERVAL` in
+`scientia/net.py`). Redirects are followed hop by hop, and each hop waits for its site's
+turn, so parallel workers never send a publisher a burst of requests. Without this, a
+parallel run once got the machine's IP blocked by Elsevier's Cloudflare protection.
+
 ## Next steps
 
 - `scientia update`: re-search with recent-first sorting, triage only what is new, and write a "what's new since last time" digest; schedule it weekly.
