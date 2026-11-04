@@ -51,7 +51,7 @@ def classify(paper, files: dict, log) -> tuple[str, str]:
         sites = sorted({a["via"] for a in failed_links})
         return ("free copy, download failed",
                 "; ".join(reasons) + f" (tried: {', '.join(sites)})")
-    if any(a["result"] == "skipped_paid" for a in attempts):
+    if any(a["via"] == "openalex-content" and a["result"] in ("skipped_paid", "skipped_disabled") for a in attempts):
         return "free copy, OpenAlex cache", "only copy found is OpenAlex's cached PDF ($0.01 with --allow-paid)"
     if paper.oa_status in OPEN_STATUSES:
         return "free copy, download failed", f"OpenAlex marks it {paper.oa_status} open access, but no route found a downloadable copy"

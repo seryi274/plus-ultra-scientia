@@ -43,6 +43,7 @@ from scientia.store import Store, StoredPaper
 _MAX_BYTES = 100 * 1024 * 1024
 _UNPAYWALL = "https://api.unpaywall.org/v2"
 _BREAKER_LIMIT = 12  # consecutive service failures before a route is switched off for the run
+# (for the OpenAlex PDF cache, refusals once the daily budget is spent count as failures)
 
 
 class _Breaker:
@@ -177,7 +178,11 @@ class Acquirer:
             outcome.pdf = existing["pdf"]
         else:
             for url, via, license in self._pdf_candidates(paper, outcome):
-                if data := self._download(url, outcome, via, expect=b"%PDF"):
+                data = self._download(url, outcome, via, expect=b"%PDF")
+                if via == "openalex-content":  # metered: stop once the daily budget is spent
+                    result = outcome.tries[-1].result
+                    self._breaker.record(via, result in ("http_402", "http_429") or result.startswith("http_5"))
+                if data:
                     outcome.pdf = self._save(outcome, folder / "paper.pdf", data, "pdf", url, via, license)
                     break
         return outcome
@@ -205,6 +210,8 @@ class Acquirer:
         if paper.openalex_has_pdf and paper.openalex_id:
             if not self._allow_paid:
                 outcome.tries.append(Attempt("openalex-content", None, "skipped_paid", "costs $0.01; --allow-paid"))
+            elif self._skip("openalex-content", outcome):
+                return
             elif url := self._openalex.content_url(paper.openalex_id):
                 yield url, "openalex-content", paper.license
             else:

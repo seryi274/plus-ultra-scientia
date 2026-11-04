@@ -675,6 +675,16 @@ class Store:
         )
 
     def save_fetch_log(self, paper_id: int, succeeded: bool, attempts: list[dict]) -> None:
+        """Record a fetch attempt, keeping what earlier attempts learned about routes this one
+        didn't try (e.g. a link found when a since-disabled lookup service still worked)."""
+        row = self.conn.execute("SELECT attempts FROM fetch_log WHERE paper_id = ?", (paper_id,)).fetchone()
+        if row:
+            def key(a: dict) -> tuple:
+                return a["via"], a["url"]
+            tried_now = {key(a) for a in attempts if a["result"] != "skipped_disabled"}
+            kept = [o for o in json.loads(row["attempts"]) if key(o) not in tried_now]
+            known = {key(o) for o in kept}
+            attempts = [a for a in attempts if a["result"] != "skipped_disabled" or key(a) not in known] + kept
         self.conn.execute(
             """INSERT INTO fetch_log (paper_id, attempted_at, succeeded, attempts) VALUES (?, ?, ?, ?)
                ON CONFLICT (paper_id) DO UPDATE SET attempted_at = excluded.attempted_at,

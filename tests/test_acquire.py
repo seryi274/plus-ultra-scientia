@@ -77,3 +77,22 @@ def test_access_classification():
     assert classify_with("bronze", no_links) == "free copy, download failed"
     paid = [{"via": "openalex-content", "url": None, "result": "skipped_paid", "detail": ""}]
     assert classify_with("closed", no_links + paid) == "free copy, OpenAlex cache"
+
+
+def test_fetch_log_keeps_what_earlier_attempts_learned(env):
+    _, store = env
+    pid, _ = store.add_paper(Paper(title="P", source="openalex", doi="10.1/p"))
+    first = [{"via": "semanticscholar", "url": "https://pub/x.pdf", "result": "http_403", "detail": ""},
+             {"via": "core", "url": None, "result": "no_link", "detail": ""}]
+    store.save_fetch_log(pid, False, first)
+    # A later run with both lookups switched off must not erase the known free copy.
+    store.save_fetch_log(pid, False, [
+        {"via": "semanticscholar", "url": None, "result": "skipped_disabled", "detail": ""},
+        {"via": "core", "url": None, "result": "skipped_disabled", "detail": ""},
+        {"via": "openalex-content", "url": "https://content/x.pdf", "result": "http_429", "detail": ""},
+    ])
+    merged = json.loads(store.fetch_logs()[pid]["attempts"])
+    assert {"via": "semanticscholar", "url": "https://pub/x.pdf", "result": "http_403", "detail": ""} in merged
+    assert {"via": "core", "url": None, "result": "no_link", "detail": ""} in merged
+    assert not any(a["via"] == "core" and a["result"] == "skipped_disabled" for a in merged)
+    assert classify(NS(oa_status="closed"), {}, store.fetch_logs()[pid])[0] == "free copy, download failed"
