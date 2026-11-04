@@ -13,6 +13,7 @@
     scientia review <topic> --stage extract [--wait]
     scientia evidence <topic>
     scientia inventory <topic> [<topic> ...]
+    scientia manual-list <topic> [<topic> ...] [--include-relevant] [--include-reviews]
     scientia report <topic>
     scientia mark   <topic> <paper> read|skipped|new
     scientia topics
@@ -33,7 +34,7 @@ from scientia.backup import backup_library
 from scientia.config import Config
 from scientia.evidence import write_evidence
 from scientia.importer import Importer, pdf_files
-from scientia.inventory import format_counts, write_inventory
+from scientia.inventory import format_counts, write_inventory, write_manual_list
 from scientia.net import HttpClient
 from scientia.pipeline import (
     SKIPPED_TYPES, SOURCES, clip, expand_params, refresh_oa_status, rescore, run_expand, run_fetch,
@@ -170,6 +171,14 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--no-refresh", action="store_true",
                    help="don't fetch missing open-access statuses from OpenAlex (about $0.0001 per 100 papers)")
     p.set_defaults(handler=cmd_inventory)
+
+    p = sub.add_parser("manual-list", help="checklist of key papers without full text, to download by hand")
+    p.add_argument("topics", nargs="+")
+    p.add_argument("--out", type=Path, help="Markdown path (default: <library>/topics/manual-list-<topics>.md)")
+    p.add_argument("--include-relevant", action="store_true", help="also papers rated relevant, not only central")
+    p.add_argument("--include-reviews", action="store_true",
+                   help="also narrative reviews, guidelines, case reports and 'other' designs")
+    p.set_defaults(handler=cmd_manual_list)
 
     p = sub.add_parser("report", help="write a Markdown reading list for a topic")
     p.add_argument("topic")
@@ -352,6 +361,14 @@ def cmd_inventory(args, config: Config, store: Store, http: HttpClient) -> int:
     out = args.out or config.topics_dir / f"inventory-{'+'.join(_slug(t) for t in args.topics)}.csv"
     print("\n" + format_counts(write_inventory(store, args.topics, out)))
     print(f"\nWrote {out}")
+    return 0
+
+
+def cmd_manual_list(args, config: Config, store: Store, http: HttpClient) -> int:
+    out = args.out or config.topics_dir / f"manual-list-{'+'.join(_slug(t) for t in args.topics)}.md"
+    relevance = ("central", "relevant") if args.include_relevant else ("central",)
+    free, licence = write_manual_list(store, args.topics, out, config.inbox_dir, relevance, args.include_reviews)
+    print(f"{free} free copies to open in a browser, {licence} needing a licence.\nWrote {out}")
     return 0
 
 

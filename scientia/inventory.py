@@ -128,3 +128,69 @@ def format_counts(counts: dict[tuple[str, str], int]) -> str:
     total = sum(counts.values())
     lines.append(f"{'total':<{width}}  {total_cr:>16}  {total - total_cr:>6}  {total:>6}")
     return "\n".join(lines)
+
+
+# Study designs worth fetching by hand first: primary research and evidence syntheses.
+SECONDARY_DESIGNS = {"narrative_review", "guideline_or_consensus", "case_report_or_series", "other"}
+_FREE_URL_ORDER = ("pmc", "oa-link", "unpaywall", "semanticscholar", "core", "europepmc-xml")
+
+
+def write_manual_list(store: Store, topic_names: list[str], path: Path, inbox: Path,
+                      relevance: tuple[str, ...] = ("central",), include_secondary: bool = False) -> tuple[int, int]:
+    """A checklist of papers without full text, for downloading by hand: free copies first
+    (their known link usually works in a browser), then papers needing a licence. Returns
+    (free, licence) counts."""
+    topics = {name: store.topic_id(name) for name in topic_names}
+    logs = store.fetch_logs()
+    best: dict[int, tuple[float, dict, list[str], object]] = {}
+    rank = {"central": 3, "relevant": 2, "tangential": 1, "off_topic": 0}
+    for name, tid in topics.items():
+        triage = {pid: json.loads(r["result"]) for pid, r in store.reviews(tid, "triage").items() if r["status"] == "ok"}
+        for p in store.topic_papers(tid):
+            t = triage.get(p.id)
+            if not t or t["relevance"] not in relevance or store.files(p.id):
+                continue
+            if not include_secondary and t["study_design"] in SECONDARY_DESIGNS:
+                continue
+            if p.id in best:
+                best[p.id][2].append(name)
+                if (rank[t["relevance"]], p.score) > (rank[best[p.id][1]["relevance"]], best[p.id][0]):
+                    best[p.id] = (p.score, t, best[p.id][2], p)
+            else:
+                best[p.id] = (p.score, t, [name], p)
+
+    free, licence = [], []
+    for pid, (score, t, names, p) in sorted(best.items(), key=lambda kv: -kv[1][0]):
+        access, _ = classify(p, {}, logs.get(pid))
+        failed = [a for a in json.loads(logs[pid]["attempts"])] if pid in logs else []
+        urls = [a["url"] for via in _FREE_URL_ORDER for a in failed
+                if a["via"] == via and a["url"] and a["result"] != "ok" and "api." not in a["url"]]
+        entry = (p, t, names, urls[0] if urls else None)
+        (free if access.startswith("free copy") else licence).append(entry)
+
+    def line(p, t, names, url) -> str:
+        doi = f"https://doi.org/{p.doi}" if p.doi else (p.landing_url or "")
+        links = " · ".join(x for x in (f"[free copy]({url})" if url else "", f"[DOI]({doi})" if doi else "") if x)
+        tags = f"{p.tags} " if p.tags else ""
+        return (f"- [ ] {tags}**{p.title}** ({p.year or 'n.d.'}) — {p.venue or '-'} · "
+                f"{t['study_design'].replace('_', ' ')} · {', '.join(names)} · id {p.id}\n"
+                f"  {links}\n  *{t['reason']}*")
+
+    parts = [
+        f"# Manual download list: {', '.join(topic_names)}",
+        f"{len(free) + len(licence)} papers rated {' or '.join(relevance)} that have no full text yet"
+        + ("" if include_secondary else " (primary research and systematic reviews only)") + ", best first.",
+        f"Save each PDF into `{inbox}` (any file name), then run `scientia import --move`: "
+        "files are matched to their paper by DOI or title.",
+    ]
+    if free:
+        parts.append(f"## 1. Free copies blocked for scripts ({len(free)})\n\n"
+                     "A legal free copy exists; open the *free copy* link in your browser.\n\n"
+                     + "\n".join(line(*e) for e in free))
+    if licence:
+        parts.append(f"## 2. Need a licence ({len(licence)})\n\n"
+                     "No free copy is known; open the DOI link while signed in to your library.\n\n"
+                     + "\n".join(line(*e) for e in licence))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+    return len(free), len(licence)

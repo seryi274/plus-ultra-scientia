@@ -146,3 +146,27 @@ def test_landing_page_citation_pdf_url_is_followed(env):
     outcome = acquirer.fetch(store.get_paper(pid))
     assert outcome.pdf and store.files(pid)["pdf"]["url"] == "https://publisher.example/real.pdf"
     assert [t.result for t in outcome.tries if t.via == "oa-link"] == ["not_pdf", "ok"]
+
+
+def test_manual_list_puts_free_copies_first_and_skips_secondary_designs(env, tmp_path):
+    from scientia.inventory import write_manual_list
+
+    _, store = env
+    topic = store.upsert_topic("t", "q")
+    papers = {}
+    for name, design in (("Free trial", "randomized_controlled_trial"), ("Paywalled cohort", "cohort"),
+                         ("A narrative review", "narrative_review")):
+        pid, _ = store.add_paper(Paper(title=name, source="openalex", doi=f"10.1/{name[:4].lower()}", year=2020))
+        store.link(topic, pid)
+        store.save_review(topic, pid, "triage", "ok", "m", result=json.dumps(
+            {"relevance": "central", "reason": "why", "study_design": design, "key_terms": []}))
+        papers[name] = pid
+    store.save_fetch_log(papers["Free trial"], False, [
+        {"via": "unpaywall", "url": "https://repo.example/trial.pdf", "result": "http_403", "detail": ""}])
+    store.save_fetch_log(papers["Paywalled cohort"], False, [{"via": "core", "url": None, "result": "no_link", "detail": ""}])
+
+    out = tmp_path / "list.md"
+    assert write_manual_list(store, ["t"], out, tmp_path / "inbox") == (1, 1)
+    text = out.read_text(encoding="utf-8")
+    assert text.index("Free trial") < text.index("Paywalled cohort")
+    assert "[free copy](https://repo.example/trial.pdf)" in text and "narrative review" not in text.lower().split("## 1")[1]

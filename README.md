@@ -91,6 +91,7 @@ scientia evidence axspa-treatment                         # evidence.md + eviden
 
 scientia fetch neural-operators --top 10 -v   # download open-access PDFs / XML (6 in parallel)
 scientia inventory axspa-treatment axspa-genetics-immunology   # every paper, relevance + access, as CSV
+scientia manual-list axspa-treatment axspa-genetics-immunology # checklist of key papers to download by hand
 scientia report neural-operators              # <library>/topics/neural-operators/reading-list.md
 scientia import --move                        # file PDFs you saved into <library>/inbox/
 scientia mark neural-operators 12 read --note "key idea: spectral convolution"
