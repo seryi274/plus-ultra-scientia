@@ -2,7 +2,9 @@
 
 Routes, cheapest and most reliable first:
   1. arXiv PDF                    (free; paced to 1 request / 3 s)
-  2. Europe PMC JATS XML          (free; open-access subset only, the approved PMC route)
+  2. PubMed Central on AWS        (free; PDF + JATS XML + licence for PMC open-access articles,
+                                   NIH's approved route for automated retrieval)
+     Europe PMC JATS XML          (free; fallback for the XML when PMC has no copy)
   3. Open-access PDF links        (free; from OpenAlex locations and Europe PMC)
   4. Unpaywall DOI lookup         (free; needs UNPAYWALL_EMAIL or SCIENTIA_EMAIL)
   5. Semantic Scholar             (free; openAccessPdf by DOI, PMID or exact title)
@@ -16,6 +18,9 @@ the library can then be filed with `scientia import` (see importer.py).
 
 Every route tried is recorded (store.fetch_log), so a failed paper can be told apart as
 "a free copy exists but could not be downloaded" or "no free copy is known".
+
+When a PDF link answers with the article's web page instead, the page's standard
+`citation_pdf_url` meta tag (the one Google Scholar and Zotero read) is followed once.
 
 Papers are fetched in parallel worker threads. Workers only do network and file I/O; all
 database writes happen on the calling thread, as each paper completes.
@@ -31,16 +36,23 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from urllib.parse import urljoin
 
 from scientia.config import Config
 from scientia.net import HttpClient
 from scientia.sources.core import Core
 from scientia.sources.europepmc import EuropePMC
 from scientia.sources.openalex import OpenAlex
+from scientia.sources.pmc import PMCArticle, PMCCloud
 from scientia.sources.semanticscholar import SemanticScholar
 from scientia.store import Store, StoredPaper
 
 _MAX_BYTES = 100 * 1024 * 1024
+_META_PDF = re.compile(
+    rb"""<meta\s+(?:name=["']citation_pdf_url["']\s+content=["']([^"']+)["']"""
+    rb"""|content=["']([^"']+)["']\s+name=["']citation_pdf_url["'])""",
+    re.IGNORECASE,
+)
 _UNPAYWALL = "https://api.unpaywall.org/v2"
 _BREAKER_LIMIT = 12  # consecutive service failures before a route is switched off for the run
 # (for the OpenAlex PDF cache, refusals once the daily budget is spent count as failures)
@@ -114,6 +126,7 @@ class Acquirer:
         self._openalex = OpenAlex(http, config.openalex_api_key)
         self._s2 = SemanticScholar(http, config.s2_api_key)
         self._core = Core(http, config.core_api_key)
+        self._pmc = PMCCloud(http)
         self._allow_paid = allow_paid
         self._s2_known: dict[int, tuple[str, str | None] | None] = {}  # filled by prefetch()
         self._breaker = _Breaker()
@@ -163,9 +176,12 @@ class Acquirer:
     def _fetch_files(self, paper: StoredPaper, existing: dict[str, Path]) -> Outcome:
         outcome = Outcome()
         folder = self._config.papers_dir / paper_slug(paper)
+        pmc = self._find_pmc(paper, outcome) if paper.pmcid and ("pdf" not in existing or "xml" not in existing) else None
 
         if "xml" in existing:
             outcome.xml = existing["xml"]
+        elif pmc and pmc.xml_url and (data := self._download(pmc.xml_url, outcome, "pmc", expect=b"<")):
+            outcome.xml = self._save(outcome, folder / "paper.xml", data, "xml", pmc.xml_url, "pmc", pmc.license)
         elif paper.pmcid and paper.is_oa and not self._skip("europepmc-xml", outcome):
             url = EuropePMC.fulltext_xml_url(paper.pmcid)
             data = self._download(url, outcome, "europepmc-xml", expect=b"<")
@@ -177,23 +193,41 @@ class Acquirer:
         if "pdf" in existing:
             outcome.pdf = existing["pdf"]
         else:
-            for url, via, license in self._pdf_candidates(paper, outcome):
+            for url, via, license in self._pdf_candidates(paper, outcome, pmc):
                 data = self._download(url, outcome, via, expect=b"%PDF")
                 if via == "openalex-content":  # metered: stop once the daily budget is spent
                     result = outcome.tries[-1].result
                     self._breaker.record(via, result in ("http_402", "http_429") or result.startswith("http_5"))
-                if data:
-                    outcome.pdf = self._save(outcome, folder / "paper.pdf", data, "pdf", url, via, license)
+                if data:  # the last attempt is the one that succeeded, possibly a followed link
+                    outcome.pdf = self._save(outcome, folder / "paper.pdf", data, "pdf",
+                                             outcome.tries[-1].url or url, via, license)
                     break
         return outcome
 
-    def _pdf_candidates(self, paper: StoredPaper, outcome: Outcome):
+    def _find_pmc(self, paper: StoredPaper, outcome: Outcome) -> PMCArticle | None:
+        if self._skip("pmc", outcome):
+            return None
+        try:
+            article = self._pmc.find(paper.pmcid)
+        except Exception as exc:
+            outcome.tries.append(Attempt("pmc", None, "lookup_failed", str(exc)))
+            self._breaker.record("pmc", failed=True)
+            return None
+        self._breaker.record("pmc", failed=False)
+        if article is None:
+            outcome.tries.append(Attempt("pmc", None, "no_link", "not in the PMC open-access datasets"))
+        return article
+
+    def _pdf_candidates(self, paper: StoredPaper, outcome: Outcome, pmc: PMCArticle | None = None):
         """Yield (url, via, license) lazily, so later (slower or paid) routes only run if needed."""
         tried: set[str] = set()
         if paper.arxiv_id:
             url = f"https://arxiv.org/pdf/{paper.arxiv_id}"
             tried.add(url)
             yield url, "arxiv", None
+        if pmc and pmc.pdf_url:
+            tried.add(pmc.pdf_url)
+            yield pmc.pdf_url, "pmc", pmc.license
         for url in paper.pdf_urls:
             if url not in tried and "arxiv.org/" not in url:
                 tried.add(url)
@@ -270,7 +304,8 @@ class Acquirer:
             outcome.tries.append(Attempt("unpaywall", None, "no_link"))
         return found
 
-    def _download(self, url: str, outcome: Outcome, via: str, expect: bytes) -> bytes | None:
+    def _download(self, url: str, outcome: Outcome, via: str, expect: bytes,
+                  follow_meta: bool = True) -> bytes | None:
         label = re.sub(r"api_key=[^&]+", "api_key=***", url)
         try:
             response = self._http.get(url, headers=self._core.headers_for(url))
@@ -287,6 +322,9 @@ class Acquirer:
         if not data.lstrip()[:5].startswith(expect):
             # Typically an HTML landing page, login wall or captcha instead of the document.
             outcome.tries.append(Attempt(via, label, "not_pdf" if expect == b"%PDF" else "not_xml"))
+            if expect == b"%PDF" and follow_meta and (target := _meta_pdf_url(data, str(response.url))) \
+                    and target != url:
+                return self._download(target, outcome, via, expect, follow_meta=False)
             return None
         outcome.tries.append(Attempt(via, label, "ok", f"{len(data) // 1024} KiB"))
         return data
@@ -308,6 +346,14 @@ class Acquirer:
             self._store.save_fetch_log(paper.id, outcome.ok, [asdict(t) for t in outcome.tries])
         if outcome.saved:
             write_metadata(self._store, paper, self._config.papers_dir / paper_slug(paper))
+
+
+def _meta_pdf_url(html: bytes, base: str) -> str | None:
+    """The `citation_pdf_url` an article's landing page declares, if any."""
+    if m := _META_PDF.search(html[:300_000]):
+        link = (m.group(1) or m.group(2)).decode("utf-8", "replace").replace("&amp;", "&")
+        return urljoin(base, link)
+    return None
 
 
 def write_metadata(store: Store, paper: StoredPaper, folder: Path) -> None:

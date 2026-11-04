@@ -21,7 +21,7 @@ from pathlib import Path
 from scientia.store import Store
 
 OPEN_STATUSES = {"gold", "green", "hybrid", "bronze", "diamond"}
-_DOWNLOAD_VIAS = {"arxiv", "oa-link", "unpaywall", "semanticscholar", "core", "europepmc-xml"}
+_DOWNLOAD_VIAS = {"arxiv", "pmc", "oa-link", "unpaywall", "semanticscholar", "core", "europepmc-xml"}
 _REASONS = {
     "not_pdf": "link returned a web page (publisher block, login or captcha) instead of the PDF",
     "not_xml": "Europe PMC returned no full-text XML",

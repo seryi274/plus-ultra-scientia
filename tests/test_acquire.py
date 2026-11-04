@@ -96,3 +96,53 @@ def test_fetch_log_keeps_what_earlier_attempts_learned(env):
     assert {"via": "core", "url": None, "result": "no_link", "detail": ""} in merged
     assert not any(a["via"] == "core" and a["result"] == "skipped_disabled" for a in merged)
     assert classify(NS(oa_status="closed"), {}, store.fetch_logs()[pid])[0] == "free copy, download failed"
+
+
+class FakePMCHttp:
+    """PMC cloud bucket with versions 1 and 2 of PMC123; a publisher landing page that
+    declares its PDF in a citation_pdf_url meta tag."""
+
+    def __init__(self):
+        self.urls = []
+
+    def get(self, url, params=None, **kwargs):
+        self.urls.append(url)
+        if url.endswith("amazonaws.com/") and params:
+            body = "".join(f"<CommonPrefixes><Prefix>{params['prefix']}{v}/</Prefix></CommonPrefixes>" for v in (1, 2))
+            return NS(status_code=200, text=f"<ListBucketResult>{body}</ListBucketResult>")
+        if url.endswith("PMC123.2.json"):
+            return NS(status_code=200, json=lambda: {
+                "license_code": "CC BY", "pdf_url": "s3://pmc-oa-opendata/PMC123.2/PMC123.2.pdf?md5=x",
+                "xml_url": "s3://pmc-oa-opendata/PMC123.2/PMC123.2.xml?md5=y"})
+        if url.endswith("PMC123.2.pdf") or url == "https://publisher.example/real.pdf":
+            return NS(status_code=200, content=b"%PDF-1.7 ok", url=url)
+        if url.endswith("PMC123.2.xml"):
+            return NS(status_code=200, content=b"<article/>", url=url)
+        if url == "https://publisher.example/landing":
+            page = b'<html><head><meta name="citation_pdf_url" content="/real.pdf"></head></html>'
+            return NS(status_code=200, content=page, url=url)
+        return NS(status_code=404, content=b"", url=url, json=lambda: {})
+
+
+def test_pmc_cloud_supplies_pdf_xml_and_licence(env):
+    config, store = env
+    pid, _ = store.add_paper(Paper(title="PMC paper", source="europepmc", pmcid="PMC123", is_oa=True))
+    acquirer = Acquirer(config, store, FakePMCHttp())
+    acquirer._s2_known = {pid: None}
+    outcome = acquirer.fetch(store.get_paper(pid))
+    files = store.files(pid)
+    assert outcome.pdf and outcome.xml
+    assert files["pdf"]["via"] == files["xml"]["via"] == "pmc"
+    assert files["pdf"]["license"] == "CC BY"
+    assert files["pdf"]["url"].endswith("/PMC123.2/PMC123.2.pdf")  # latest version
+
+
+def test_landing_page_citation_pdf_url_is_followed(env):
+    config, store = env
+    pid, _ = store.add_paper(Paper(title="Landing", source="openalex", doi="10.1/l",
+                                   pdf_urls=["https://publisher.example/landing"]))
+    acquirer = Acquirer(config, store, FakePMCHttp())
+    acquirer._s2_known = {pid: None}
+    outcome = acquirer.fetch(store.get_paper(pid))
+    assert outcome.pdf and store.files(pid)["pdf"]["url"] == "https://publisher.example/real.pdf"
+    assert [t.result for t in outcome.tries if t.via == "oa-link"] == ["not_pdf", "ok"]

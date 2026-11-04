@@ -255,8 +255,9 @@ def run_fetch(store: Store, http: HttpClient, config: Config, topic_id: int, *, 
               retry: bool = False, min_score: float = 0.0, workers: int = 6, allow_paid: bool = False,
               verbose: bool = False, log: Log = print) -> FetchSummary:
     candidates = store.topic_papers(topic_id, status="new")
-    if retry:
+    if retry:  # failed papers, and papers we only have as XML
         candidates += store.topic_papers(topic_id, status="unavailable")
+        candidates += [p for p in store.topic_papers(topic_id, status="downloaded") if "pdf" not in store.files(p.id)]
         candidates.sort(key=lambda p: p.score, reverse=True)
     candidates = [p for p in candidates if p.score >= min_score][:top]
     summary = FetchSummary(attempted=len(candidates))
