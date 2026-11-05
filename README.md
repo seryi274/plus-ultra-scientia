@@ -55,8 +55,8 @@ scientia run ..\axspa-research --topic axspa-treatment --steps search,triage
 LLM spend per run is capped by `max_review_cost`. If the estimate exceeds the cap, the
 top-ranked papers that fit are reviewed and the rest wait for the next run.
 
-Outputs go to `<project>/outputs/`: `inventory.csv`, plus `<topic>/reading-list.md` and
-`<topic>/evidence.md`. All papers, PDFs and the database stay in the shared library, so a
+Outputs go to `<project>/outputs/`: `inventory.csv`, `glossary.md` (with a `[glossary]`
+table), plus `<topic>/reading-list.md` and `<topic>/evidence.md`. All papers, PDFs and the database stay in the shared library, so a
 paper found by two projects is stored once. The format is documented at the top of
 `scientia/project.py`.
 
@@ -88,6 +88,7 @@ scientia review axspa-treatment --wait                    # collect the batch wh
 scientia review axspa-treatment --stage extract --dry-run # cost estimate first
 scientia review axspa-treatment --stage extract --wait
 scientia evidence axspa-treatment                         # evidence.md + evidence.csv
+scientia glossary axspa-treatment axspa-genetics-immunology --language es  # plain-language glossary (Haiku)
 
 scientia fetch neural-operators --top 10 -v   # download open-access PDFs / XML (6 in parallel)
 scientia inventory axspa-treatment axspa-genetics-immunology   # every paper, relevance + access, as CSV
@@ -269,6 +270,32 @@ pathways, key findings, public datasets and stated therapeutic implications.
 
 Costs on the AS pilot (about 700 papers per topic): triage about $0.13 per topic, and
 extraction about $0.013 per paper at batch price.
+
+## Glossary
+
+`scientia glossary <topic> [<topic> ...] --language es` writes a plain-language glossary
+of the field's vocabulary, for readers without a background in it. Add `[glossary]` to
+`project.toml` to make it a step of `run`, written to `outputs/glossary.md`.
+
+How it is built:
+- **Terms:** the triage key terms used in at least `--min-papers` papers (default 3), from
+  papers rated central, relevant or tangential.
+- **Spelling variants** are merged mechanically: case, plurals, hyphens, HLA-style
+  asterisks and Greek letters.
+- **Definitions:** Claude Haiku defines the terms in chunks of 20, in the chosen language.
+  It gets the project's research questions and the titles of papers using each term.
+  Each entry gives:
+  - a definition of two or three sentences;
+  - a line on why the term matters in this field;
+  - what the term's abbreviation stands for.
+- **Synonyms** that spelling cannot catch ("anti-TNF", "TNFi", "TNF inhibitors") are named
+  by the model and merged into one entry.
+- **Examples:** each entry links up to three example papers, to their PDFs when downloaded.
+- **Uncertain entries:** when the model is unsure what a term refers to, it says only
+  what the titles show, and the entry is marked ⚠.
+
+Definitions are stored in the library per language, so later runs only define new terms.
+The axSpA project (365 terms) cost $0.08.
 
 ## Backing up the library
 

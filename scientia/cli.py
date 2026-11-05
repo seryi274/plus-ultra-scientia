@@ -14,6 +14,7 @@
     scientia evidence <topic>
     scientia inventory <topic> [<topic> ...]
     scientia manual-list <topic> [<topic> ...] [--include-relevant] [--include-reviews]
+    scientia glossary <topic> [<topic> ...] [--language es] [--min-papers 3] [--dry-run]
     scientia report <topic>
     scientia mark   <topic> <paper> read|skipped|new
     scientia topics
@@ -33,6 +34,7 @@ from pathlib import Path
 from scientia.backup import backup_library
 from scientia.config import Config
 from scientia.evidence import write_evidence
+from scientia.glossary import run_glossary
 from scientia.importer import Importer, pdf_files
 from scientia.inventory import format_counts, write_inventory, write_manual_list
 from scientia.net import HttpClient
@@ -179,6 +181,16 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--include-reviews", action="store_true",
                    help="also narrative reviews, guidelines, case reports and 'other' designs")
     p.set_defaults(handler=cmd_manual_list)
+
+    p = sub.add_parser("glossary", help="plain-language glossary of the topics' key terms (Haiku)")
+    p.add_argument("topics", nargs="+", help="one or more triaged topics")
+    p.add_argument("--language", default="en", help="language of the definitions, e.g. es (default en)")
+    p.add_argument("--min-papers", type=int, default=3, help="terms used in at least this many papers (default 3)")
+    p.add_argument("--max-terms", type=int, default=400)
+    p.add_argument("--max-cost", type=float, help="cap the estimated cost (USD); defines the most used terms that fit")
+    p.add_argument("--out", type=Path, help="Markdown path (default: <library>/topics/glossary-<topics>.md)")
+    p.add_argument("--dry-run", action="store_true", help="show how many terms would be defined and the cost")
+    p.set_defaults(handler=cmd_glossary)
 
     p = sub.add_parser("report", help="write a Markdown reading list for a topic")
     p.add_argument("topic")
@@ -370,6 +382,15 @@ def cmd_manual_list(args, config: Config, store: Store, http: HttpClient) -> int
     free, licence = write_manual_list(store, args.topics, out, config.inbox_dir, relevance, args.include_reviews)
     print(f"{free} free copies to open in a browser, {licence} needing a licence.\nWrote {out}")
     return 0
+
+
+def cmd_glossary(args, config: Config, store: Store, http: HttpClient) -> int:
+    topic_ids = [store.topic_id(t) for t in args.topics]
+    out = args.out or config.topics_dir / f"glossary-{'+'.join(_slug(t) for t in args.topics)}.md"
+    cost = run_glossary(store, topic_ids, [store.review_settings(t)["question"] for t in topic_ids], out,
+                        title=", ".join(args.topics), language=args.language, min_papers=args.min_papers,
+                        max_terms=args.max_terms, dry_run=args.dry_run, max_cost=args.max_cost)
+    return 2 if cost is None else 0
 
 
 def cmd_report(args, config: Config, store: Store, http: HttpClient) -> int:

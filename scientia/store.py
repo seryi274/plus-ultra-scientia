@@ -151,6 +151,18 @@ CREATE TABLE IF NOT EXISTS review_batches (
     submitted_at  TEXT NOT NULL,
     collected_at  TEXT
 );
+
+-- Glossary definitions of key terms, per language; term_key merges spelling variants.
+CREATE TABLE IF NOT EXISTS glossary (
+    term_key   TEXT NOT NULL,
+    language   TEXT NOT NULL,
+    term       TEXT NOT NULL,
+    result     TEXT NOT NULL,       -- JSON: one entry of the glossary schema
+    model      TEXT NOT NULL,
+    cost_usd   REAL NOT NULL DEFAULT 0,
+    updated    TEXT NOT NULL,
+    PRIMARY KEY (term_key, language)
+);
 """
 
 # Columns added after the first release, applied to existing databases on open.
@@ -581,6 +593,28 @@ class Store:
 
     def close_review_batch(self, batch_id: str) -> None:
         self.conn.execute("UPDATE review_batches SET collected_at = ? WHERE batch_id = ?", (_now(), batch_id))
+
+    # -- glossary -----------------------------------------------------------------
+
+    def glossary(self, language: str) -> dict[str, dict]:
+        """term key -> stored entry (the parsed JSON result) for one language."""
+        return {r["term_key"]: json.loads(r["result"]) for r in self.conn.execute(
+            "SELECT term_key, result FROM glossary WHERE language = ?", (language,))}
+
+    def save_glossary_entry(self, term_key: str, language: str, term: str, entry: dict, model: str,
+                            cost_usd: float = 0.0) -> None:
+        self.conn.execute(
+            """INSERT INTO glossary (term_key, language, term, result, model, cost_usd, updated)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (term_key, language) DO UPDATE SET term = excluded.term,
+                   result = excluded.result, model = excluded.model, cost_usd = excluded.cost_usd,
+                   updated = excluded.updated""",
+            (term_key, language, term, json.dumps(entry, ensure_ascii=False), model, cost_usd, _now()),
+        )
+
+    def glossary_spend(self, language: str) -> float:
+        return self.conn.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM glossary WHERE language = ?",
+                                 (language,)).fetchone()[0]
 
     # -- citations ----------------------------------------------------------------
 

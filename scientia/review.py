@@ -296,11 +296,7 @@ class Reviewer:
         usage = message.usage
         cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
         cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-        price_in, price_out = PRICES.get(self.model(stage), (0.0, 0.0))
-        cost = ((usage.input_tokens + 1.25 * cache_write + 0.1 * cache_read) * price_in
-                + usage.output_tokens * price_out) / 1e6
-        if batch:
-            cost /= 2
+        cost = message_cost(usage, self.model(stage), batch)
 
         text = next((b.text for b in message.content if b.type == "text"), "")
         if message.stop_reason == "refusal":
@@ -319,6 +315,16 @@ class Reviewer:
             output_tokens=usage.output_tokens, cost_usd=round(cost, 6),
         )
         return status
+
+
+def message_cost(usage: Any, model: str, batch: bool = False) -> float:
+    """USD for one response, from its usage: cache writes cost 1.25x, cache reads 0.1x."""
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    price_in, price_out = PRICES.get(model, (0.0, 0.0))
+    cost = ((usage.input_tokens + 1.25 * cache_write + 0.1 * cache_read) * price_in
+            + usage.output_tokens * price_out) / 1e6
+    return cost / 2 if batch else cost
 
 
 def _paper_text(p: StoredPaper) -> str:

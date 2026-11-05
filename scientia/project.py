@@ -30,6 +30,11 @@ SCIENTIA_HOME holds the data (papers, PDFs, database), which is never versioned.
 
     [[topics.expand]]               # one table per citation-expansion step, run once each
     direction = "both"              # also: seeds, min_links, max_new, since, skip_types
+
+    [glossary]                      # optional: plain-language glossary of the topics' key terms
+    language = "es"                 # language of the definitions (default "en")
+    min_papers = 3                  # terms used in at least this many papers (default 3)
+    max_terms = 400
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from string import Template
 
 from scientia.config import Config
 from scientia.evidence import write_evidence
+from scientia.glossary import run_glossary
 from scientia.inventory import format_counts, write_inventory
 from scientia.net import HttpClient
 from scientia.pipeline import (
@@ -51,7 +57,7 @@ from scientia.pipeline import (
 from scientia.review import PROFILES
 from scientia.store import Store
 
-STEPS = ("search", "expand", "triage", "fetch", "extract", "evidence", "report", "inventory")
+STEPS = ("search", "expand", "triage", "fetch", "extract", "evidence", "report", "glossary", "inventory")
 DEFAULT_STEPS = tuple(s for s in STEPS if s != "extract")  # extraction is the costly step: opt in
 
 
@@ -80,6 +86,7 @@ class Project:
     description: str
     max_review_cost: float | None
     topics: list[TopicSpec] = field(default_factory=list)
+    glossary: dict | None = None  # run_glossary settings: language, min_papers, max_terms
 
     @property
     def outputs(self) -> Path:
@@ -138,6 +145,12 @@ def load_project(path: Path) -> Project:
         ))
     if not project.topics:
         _fail(f"{file} declares no [[topics]]")
+    if (glossary := data.get("glossary")) is not None:
+        if unknown := set(glossary) - {"language", "min_papers", "max_terms"}:
+            _fail(f"[glossary]: unknown setting(s) {', '.join(sorted(unknown))}")
+        project.glossary = {"language": glossary.get("language", "en"),
+                            "min_papers": glossary.get("min_papers", 3),
+                            "max_terms": glossary.get("max_terms", 400)}
     return project
 
 
@@ -226,6 +239,17 @@ def run_project(project: Project, store: Store, http: HttpClient, config: Config
         if "report" in steps and not dry_run:
             log(f"wrote {write_reading_list(store, topic_id, spec.name, out, config.inbox_dir)}")
 
+    all_ids = [store.topic_id(t.name) for t in project.topics]
+    if "glossary" in steps and project.glossary:
+        log("\n=== glossary")
+        remaining = None if budget is None else max(0.0, budget - planned)
+        cost = run_glossary(store, all_ids, [t.question for t in project.topics], project.outputs / "glossary.md",
+                            title=project.description or project.name, dry_run=dry_run, max_cost=remaining,
+                            log=log, **project.glossary)
+        if cost is None:
+            return 2
+        planned += cost
+
     if "inventory" in steps and not dry_run:
         names = [t.name for t in project.topics]
         refresh_oa_status(store, http, config, [store.topic_id(n) for n in names], log=log)
@@ -233,7 +257,9 @@ def run_project(project: Project, store: Store, http: HttpClient, config: Config
         log("\n" + format_counts(write_inventory(store, names, path)))
         log(f"wrote {path}")
 
-    spent = review_spend(store, [store.topic_id(t.name) for t in project.topics])
+    spent = review_spend(store, all_ids)
+    if project.glossary:
+        spent += store.glossary_spend(project.glossary["language"])
     verb = "would cost" if dry_run else "submitted"
     log(f"\nLLM review: {verb} ~${planned:.2f} this run; ${spent:.2f} recorded for the project so far.")
     return 0
