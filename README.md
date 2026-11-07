@@ -165,6 +165,11 @@ filed under `papers/` and marked `downloaded` in every topic waiting for it. Wit
 and added to that topic. Identical files are detected by hash. Unmatched files are left
 in place.
 
+If a file can't be matched, file it by hand with `scientia import <pdf> --paper <id>`, using
+the id from `list` or the inventory. Typical cases are a supplement page holding several
+congress abstracts, or a DOI with more than one slash, which a file name can't carry. The
+import still reads any DOIs in the PDF, and warns if they differ from the paper's.
+
 **Subscription content is intentionally not automated.** UNED's library forbids automated
 mass downloading through its proxy. The legitimate route is the publishers' text-and-data-mining
 APIs (Elsevier, Wiley, Springer Nature), which need entitlement confirmed by the library.

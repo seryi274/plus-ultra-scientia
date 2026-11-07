@@ -101,7 +101,9 @@ class Importer:
         self._openalex = openalex
 
     def import_pdf(self, path: Path, topic_id: int | None = None, move: bool = False,
-                   force: bool = False) -> ImportResult:
+                   force: bool = False, paper_id: int | None = None) -> ImportResult:
+        """`paper_id` files the PDF under that paper without matching, for files whose DOI
+        cannot be read or written in a file name (e.g. 10.1093/rheumatology/key075.414)."""
         data = path.read_bytes()
         if not data[:1024].lstrip().startswith(b"%PDF"):
             return ImportResult(path, "not-pdf", "file does not start with a PDF header")
@@ -109,6 +111,9 @@ class Importer:
         if (existing := self._store.file_with_hash(sha)) and not force:
             return ImportResult(path, "duplicate", f"identical file already filed at {self._store.resolve(existing['path'])}",
                                 existing["paper_id"])
+
+        if paper_id is not None:
+            return self._file_as(path, paper_id, topic_id, move, force, sha)
 
         try:
             ev = read_evidence(path)
@@ -123,7 +128,24 @@ class Importer:
         if paper_id is None:
             found = ", ".join(d for d, _ in ev.dois[:3]) or "no DOI found"
             return ImportResult(path, "unmatched", f"no matching paper ({found})")
+        return self._file(path, paper_id, topic_id, move, force, sha, status, how)
 
+    def _file_as(self, path: Path, paper_id: int, topic_id: int | None, move: bool, force: bool,
+                 sha: str) -> ImportResult:
+        if self._store.conn.execute("SELECT 1 FROM papers WHERE id = ?", (paper_id,)).fetchone() is None:
+            return ImportResult(path, "unmatched", f"no paper with id {paper_id}")
+        how = f"paper id {paper_id} given"
+        doi = self._store.get_paper(paper_id).doi
+        try:
+            found = [d for d, _ in read_evidence(path).dois]
+        except Exception:
+            found = []  # unreadable text is no reason to refuse a file the user identified
+        if doi and found and doi not in found:
+            how += f"; note: the PDF names {', '.join(found[:3])}, not {doi}"
+        return self._file(path, paper_id, topic_id, move, force, sha, "imported", how)
+
+    def _file(self, path: Path, paper_id: int, topic_id: int | None, move: bool, force: bool, sha: str,
+              status: str, how: str) -> ImportResult:
         if topic_id is not None:
             self._store.link(topic_id, paper_id)
         if "pdf" in self._store.files(paper_id) and not force:

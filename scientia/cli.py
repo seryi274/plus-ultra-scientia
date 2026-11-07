@@ -9,6 +9,7 @@
     scientia expand <topic> [--seeds 25] [--direction both] [--min-links 2]
     scientia fetch  <topic> [--top 10] [--min-score 0.5] [--allow-paid]
     scientia import [pdfs or folders] [--topic <topic>] [--move]
+    scientia import <pdf> --paper <id>       (file a PDF under a known paper, without matching)
     scientia review <topic> --question "..." --profile clinical|genetics|general
     scientia review <topic> --stage extract [--wait]
     scientia evidence <topic>
@@ -144,6 +145,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--topic", help="also add matched papers to this topic, looking up unknown DOIs")
     p.add_argument("--move", action="store_true", help="move files instead of copying them")
     p.add_argument("--force", action="store_true", help="replace a PDF the paper already has")
+    p.add_argument("--paper", type=int, metavar="ID",
+                   help="file a single PDF under this paper id (from `list` or the inventory), skipping "
+                        "DOI and title matching")
     p.set_defaults(handler=cmd_import)
 
     p = sub.add_parser("review", help="LLM review of abstracts: Haiku triage, then Opus evidence extraction")
@@ -320,6 +324,9 @@ def cmd_import(args, config: Config, store: Store, http: HttpClient) -> int:
     topic_id = store.topic_id(args.topic) if args.topic else None
     config.inbox_dir.mkdir(parents=True, exist_ok=True)
     files = pdf_files(args.paths or [config.inbox_dir])
+    if args.paper is not None and len(files) != 1:
+        print(f"error: --paper takes exactly one PDF, not {len(files)}", file=sys.stderr)
+        return 2
     if not files:
         where = ", ".join(map(str, args.paths)) if args.paths else str(config.inbox_dir)
         print(f"No PDFs found in {where}.")
@@ -328,7 +335,8 @@ def cmd_import(args, config: Config, store: Store, http: HttpClient) -> int:
     importer = Importer(config, store, OpenAlex(http, config.openalex_api_key))
     counts: dict[str, int] = {}
     for path in files:
-        result = importer.import_pdf(path, topic_id=topic_id, move=args.move, force=args.force)
+        result = importer.import_pdf(path, topic_id=topic_id, move=args.move, force=args.force,
+                                     paper_id=args.paper)
         store.commit()
         counts[result.status] = counts.get(result.status, 0) + 1
         target = ""

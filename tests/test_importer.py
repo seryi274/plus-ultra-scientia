@@ -79,6 +79,21 @@ def test_title_on_first_page_matches_paper_without_pdf(env, tmp_path):
     assert not pdf.exists()
 
 
+def test_paper_id_files_without_matching_and_flags_other_dois(env, tmp_path):
+    config, store, importer = env
+    pid, _ = store.add_paper(Paper(title="Abstract 190", source="openalex", doi="10.1093/rheumatology/key075.414"))
+    other, _ = store.add_paper(Paper(title="Other", source="openalex", doi="10.1000/other"))
+
+    page = make_pdf(tmp_path / "supplement.pdf", "190 REAL-WORLD EXPERIENCE OF SECUKINUMAB")
+    result = importer.import_pdf(page, paper_id=pid)
+    assert (result.status, result.paper_id) == ("imported", pid) and "note" not in result.detail
+
+    wrong = make_pdf(tmp_path / "wrong.pdf", "doi:10.1000/somethingelse")
+    result = importer.import_pdf(wrong, paper_id=other)
+    assert result.status == "imported" and "10.1000/somethingelse" in result.detail  # filed, but flagged
+    assert importer.import_pdf(make_pdf(tmp_path / "x.pdf", "y"), paper_id=9999).status == "unmatched"
+
+
 def test_unmatched_and_not_pdf(env, tmp_path):
     _, _, importer = env
     assert importer.import_pdf(make_pdf(tmp_path / "a.pdf", "nothing here")).status == "unmatched"
