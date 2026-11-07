@@ -387,8 +387,10 @@ def cmd_inventory(args, config: Config, store: Store, http: HttpClient) -> int:
 def cmd_manual_list(args, config: Config, store: Store, http: HttpClient) -> int:
     out = args.out or config.topics_dir / f"manual-list-{'+'.join(_slug(t) for t in args.topics)}.md"
     relevance = ("central", "relevant") if args.include_relevant else ("central",)
-    free, licence = write_manual_list(store, args.topics, out, config.inbox_dir, relevance, args.include_reviews)
-    print(f"{free} free copies to open in a browser, {licence} needing a licence.\nWrote {out}")
+    free, repository, licence = write_manual_list(store, args.topics, out, config.inbox_dir, relevance,
+                                                  args.include_reviews)
+    print(f"{free} free copies to open in a browser, {repository} unconfirmed repository copies, "
+          f"{licence} needing a licence.\nWrote {out}")
     return 0
 
 

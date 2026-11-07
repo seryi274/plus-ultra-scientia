@@ -144,13 +144,19 @@ in Excel. Each row has its relevance rating, study design, OpenAlex open-access 
 an **access** category:
 
 - `downloaded (PDF)`, or `downloaded (XML only)`;
-- `free copy, download failed`: a legal free copy exists, but the publisher blocked the
-  script, or the link returned a web page. Usually downloadable by hand in a browser.
+- `free copy, download failed`: the publisher's version is open (OpenAlex gold, hybrid,
+  bronze or diamond), or a source that lists only open copies gave a link (PMC, Europe PMC,
+  Unpaywall, OpenAlex, arXiv). The script was blocked, but a browser usually gets it.
 - `free copy, OpenAlex cache`: only OpenAlex's cached PDF ($0.01 with `--allow-paid`);
+- `repository copy listed`: OpenAlex says green open access, but no copy was confirmed.
+  The repository file is often restricted or embargoed.
 - `licence needed`: no free copy is known; get it via the library, then `scientia import`;
 - `not attempted yet`.
 
-An "access detail" column gives the reason.
+An "access detail" column gives the reason. Failed links from CORE or Semantic Scholar don't
+count as evidence of a free copy. In a check of 50 papers by hand, they failed as often for
+paywalled papers as for free ones: CORE often has only the record, and Semantic Scholar
+often links to the publisher's landing page.
 
 ### Importing PDFs you downloaded yourself
 

@@ -4,11 +4,20 @@ as a CSV that opens directly in Excel (UTF-8 with BOM).
 Access categories:
   downloaded (PDF)            a PDF is in the library
   downloaded (XML only)       Europe PMC full-text XML, but no PDF
-  free copy, download failed  a legal free copy is known (OpenAlex open-access status, or a
-                              link some route found) but every download attempt failed
+  free copy, download failed  the publisher's version is open (OpenAlex gold, hybrid, bronze or
+                              diamond), or a source that lists only open copies (PMC, Europe PMC,
+                              Unpaywall, OpenAlex's OA link, arXiv) gave a link, but every
+                              download attempt failed
   free copy, OpenAlex cache   the only copy found is OpenAlex's cached PDF ($0.01, --allow-paid)
+  repository copy listed      OpenAlex says green open access (a repository has a record) but no
+                              copy was confirmed: these are often restricted or embargoed
   licence needed              no free copy is known: subscription or UNED library access
   not attempted yet           `scientia fetch` has not tried this paper
+
+Links from CORE and Semantic Scholar are not evidence of a free copy on their own: CORE lists
+repository records whose files are often missing or restricted, and Semantic Scholar often
+points at the publisher's landing page. Checked by hand against 50 papers in November 2026,
+those links failed as often for paywalled papers as for free ones.
 """
 
 from __future__ import annotations
@@ -21,7 +30,9 @@ from pathlib import Path
 from scientia.store import Store
 
 OPEN_STATUSES = {"gold", "green", "hybrid", "bronze", "diamond"}
+PUBLISHER_OPEN = OPEN_STATUSES - {"green"}
 _DOWNLOAD_VIAS = {"arxiv", "pmc", "oa-link", "unpaywall", "semanticscholar", "core", "europepmc-xml"}
+_OPEN_ONLY_VIAS = {"arxiv", "pmc", "oa-link", "unpaywall", "europepmc-xml"}  # list only open copies
 _REASONS = {
     "not_pdf": "link returned a web page (publisher block, login or captcha) instead of the PDF",
     "not_xml": "Europe PMC returned no full-text XML",
@@ -33,7 +44,7 @@ _REASONS = {
 }
 
 ACCESS_ORDER = ("downloaded (PDF)", "downloaded (XML only)", "free copy, download failed",
-                "free copy, OpenAlex cache", "licence needed", "not attempted yet")
+                "free copy, OpenAlex cache", "repository copy listed", "licence needed", "not attempted yet")
 
 
 def classify(paper, files: dict, log) -> tuple[str, str]:
@@ -46,16 +57,19 @@ def classify(paper, files: dict, log) -> tuple[str, str]:
         return "not attempted yet", ""
     attempts = json.loads(log["attempts"])
     failed_links = [a for a in attempts if a["via"] in _DOWNLOAD_VIAS and a["url"] and a["result"] != "ok"]
+    tried = ""
     if failed_links:
         reasons = Counter(_REASONS.get(a["result"], a["result"].replace("_", " ")) for a in failed_links)
-        sites = sorted({a["via"] for a in failed_links})
-        return ("free copy, download failed",
-                "; ".join(reasons) + f" (tried: {', '.join(sites)})")
+        tried = "; ".join(reasons) + f" (tried: {', '.join(sorted({a['via'] for a in failed_links}))})"
+    if paper.oa_status in PUBLISHER_OPEN:
+        return "free copy, download failed", f"OpenAlex marks it {paper.oa_status} open access" + (f"; {tried}" if tried else "")
+    if any(a["via"] in _OPEN_ONLY_VIAS for a in failed_links):
+        return "free copy, download failed", tried
     if any(a["via"] == "openalex-content" and a["result"] in ("skipped_paid", "skipped_disabled") for a in attempts):
         return "free copy, OpenAlex cache", "only copy found is OpenAlex's cached PDF ($0.01 with --allow-paid)"
-    if paper.oa_status in OPEN_STATUSES:
-        return "free copy, download failed", f"OpenAlex marks it {paper.oa_status} open access, but no route found a downloadable copy"
-    return "licence needed", f"no free copy found (OpenAlex: {paper.oa_status or 'unknown'})"
+    if paper.oa_status == "green":
+        return "repository copy listed", "OpenAlex lists a repository copy (green), not confirmed" + (f"; {tried}" if tried else "")
+    return "licence needed", f"no free copy confirmed (OpenAlex: {paper.oa_status or 'unknown'})" + (f"; {tried}" if tried else "")
 
 
 def write_inventory(store: Store, topic_names: list[str], path: Path) -> dict[tuple[str, str], int]:
@@ -136,10 +150,10 @@ _FREE_URL_ORDER = ("pmc", "oa-link", "unpaywall", "semanticscholar", "core", "eu
 
 
 def write_manual_list(store: Store, topic_names: list[str], path: Path, inbox: Path,
-                      relevance: tuple[str, ...] = ("central",), include_secondary: bool = False) -> tuple[int, int]:
+                      relevance: tuple[str, ...] = ("central",), include_secondary: bool = False) -> tuple[int, int, int]:
     """A checklist of papers without full text, for downloading by hand: free copies first
-    (their known link usually works in a browser), then papers needing a licence. Returns
-    (free, licence) counts."""
+    (their known link usually works in a browser), then repository copies that may be
+    restricted, then papers needing a licence. Returns (free, repository, licence) counts."""
     topics = {name: store.topic_id(name) for name in topic_names}
     logs = store.fetch_logs()
     best: dict[int, tuple[float, dict, list[str], object]] = {}
@@ -159,18 +173,23 @@ def write_manual_list(store: Store, topic_names: list[str], path: Path, inbox: P
             else:
                 best[p.id] = (p.score, t, [name], p)
 
-    free, licence = [], []
+    free, repository, licence = [], [], []
     for pid, (score, t, names, p) in sorted(best.items(), key=lambda kv: -kv[1][0]):
         access, _ = classify(p, {}, logs.get(pid))
         failed = [a for a in json.loads(logs[pid]["attempts"])] if pid in logs else []
         urls = [a["url"] for via in _FREE_URL_ORDER for a in failed
                 if a["via"] == via and a["url"] and a["result"] != "ok" and "api." not in a["url"]]
         entry = (p, t, names, urls[0] if urls else None)
-        (free if access.startswith("free copy") else licence).append(entry)
+        if access.startswith("free copy"):
+            free.append(entry)
+        elif access == "repository copy listed":
+            repository.append(entry)
+        else:
+            licence.append((p, t, names, None))  # leftover CORE / Semantic Scholar links lead nowhere
 
     def line(p, t, names, url) -> str:
         doi = f"https://doi.org/{p.doi}" if p.doi else (p.landing_url or "")
-        links = " · ".join(x for x in (f"[free copy]({url})" if url else "", f"[DOI]({doi})" if doi else "") if x)
+        links = " · ".join(x for x in (f"[copy]({url})" if url else "", f"[DOI]({doi})" if doi else "") if x)
         tags = f"{p.tags} " if p.tags else ""
         return (f"- [ ] {tags}**{p.title}** ({p.year or 'n.d.'}) — {p.venue or '-'} · "
                 f"{t['study_design'].replace('_', ' ')} · {', '.join(names)} · id {p.id}\n"
@@ -178,19 +197,23 @@ def write_manual_list(store: Store, topic_names: list[str], path: Path, inbox: P
 
     parts = [
         f"# Manual download list: {', '.join(topic_names)}",
-        f"{len(free) + len(licence)} papers rated {' or '.join(relevance)} that have no full text yet"
+        f"{len(free) + len(repository) + len(licence)} papers rated {' or '.join(relevance)} that have no full text yet"
         + ("" if include_secondary else " (primary research and systematic reviews only)") + ", best first.",
         f"Save each PDF into `{inbox}` (any file name), then run `scientia import --move`: "
         "files are matched to their paper by DOI or title.",
     ]
-    if free:
-        parts.append(f"## 1. Free copies blocked for scripts ({len(free)})\n\n"
-                     "A legal free copy exists; open the *free copy* link in your browser.\n\n"
-                     + "\n".join(line(*e) for e in free))
-    if licence:
-        parts.append(f"## 2. Need a licence ({len(licence)})\n\n"
-                     "No free copy is known; open the DOI link while signed in to your library.\n\n"
-                     + "\n".join(line(*e) for e in licence))
+    sections = [
+        ("Free copies blocked for scripts", free,
+         "The publisher's version is open, or an open-access source lists a copy: open the *copy* "
+         "or DOI link in your browser."),
+        ("Repository copy listed, not confirmed", repository,
+         "A repository has a record (green open access), but the file is often restricted or "
+         "embargoed. Try the DOI link through your library first."),
+        ("Need a licence", licence,
+         "No free copy is known: open the DOI link while signed in to your library."),
+    ]
+    for number, (title, entries, note) in enumerate((s for s in sections if s[1]), 1):
+        parts.append(f"## {number}. {title} ({len(entries)})\n\n{note}\n\n" + "\n".join(line(*e) for e in entries))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
-    return len(free), len(licence)
+    return len(free), len(repository), len(licence)
